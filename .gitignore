@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+Cargo.lock
+/test_data
+perf.data*
+flamegraph.svg
+/proptest-regressions
