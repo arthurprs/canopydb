@@ -1,0 +1,46 @@
+[package]
+name = "canopydb-fuzz"
+version = "0.0.0"
+authors = ["Automatically generated"]
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[features]
+failpoints = ["fail/failpoints"]
+
+[dependencies]
+arbitrary = "1"
+env_logger = "0.11"
+libfuzzer-sys = { version="0.4", features=["arbitrary-derive"] }
+log = "0.4"
+rand = { version = "*", features = ["small_rng"] }
+tempfile = "*"
+fail = "0.5"
+
+[dependencies.canopydb]
+path = ".."
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "fuzz_database"
+path = "fuzz_targets/fuzz_database.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_freelist"
+path = "fuzz_targets/fuzz_freelist.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_wal"
+path = "fuzz_targets/fuzz_wal.rs"
+test = false
+doc = false

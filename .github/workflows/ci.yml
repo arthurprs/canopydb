@@ -1,0 +1,146 @@
+name: Continuous integration
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  check-all-targets-stable:
+    name: Check all targets - Stable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - run: cargo check --all-targets
+      - run: cargo check --all-targets --no-default-features
+
+  check-all-targets-nightly:
+      name: Check all targets - Nightly
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v2
+        - uses: actions-rs/toolchain@v1
+          with:
+            profile: minimal
+            toolchain: nightly
+            override: true
+        - run: cargo check --all-targets
+        - run: cargo check --all-targets --no-default-features
+        - run: cargo check --all-targets --all-features
+
+  test-stable:
+    name: Tests - Stable
+    runs-on: ubuntu-latest
+    env:
+      RUST_TEST_THREADS: 1
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - run: cargo test
+
+  test-nightly:
+    name: Tests - Nightly
+    runs-on: ubuntu-latest
+    env:
+      RUST_TEST_THREADS: 1
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: nightly
+          override: true
+      - run: cargo test --features nightly
+      # no run because of shuttle feature and non-shuttle tests
+      - run: cargo test --all-features --no-run
+
+  shuttle-tests:
+    name: Shuttle Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - run: cargo test --profile shuttle --features shuttle shuttle
+
+  docs:
+    name: Build Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: nightly
+          override: true
+      - run: cargo doc --package canopydb
+        env:
+          RUSTDOCFLAGS: --cfg docsrs
+
+  fuzz-tests:
+    name: Fuzz tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: nightly
+          override: true
+      - run: cargo install cargo-fuzz
+      - run: for fuzz_test in `cargo fuzz list`; do cargo fuzz run $fuzz_test -- -max_total_time=30 -timeout=5 || exit 1; done
+      - run: cargo fuzz run fuzz_database -- -detect_leaks=0 -len_control=0 -max_total_time=300 -timeout=5 -jobs=2
+      - run: cargo fuzz run fuzz_database --features=failpoints -- -detect_leaks=0 -len_control=0 -max_total_time=300 -timeout=5 -jobs=2
+
+  lint:
+    name: Rustfmt & Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+      - run: rustup component add rustfmt
+      - uses: actions-rs/cargo@v1
+        with:
+          command: fmt
+          args: --all -- --check
+      - run: rustup component add clippy
+      - uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+          args: -- -D warnings
+
+  miri:
+    runs-on: ubuntu-latest
+    env:
+      MIRIFLAGS: -Zmiri-disable-isolation
+    steps:
+    - uses: actions/checkout@v2
+    - name: Install Rust toolchain
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: nightly
+        override: true
+        components: miri
+    - run: cargo miri run --example basic_usage
+    - run: cargo miri run --example fixed_len_key_value
+    - run: cargo miri run --example one_env_many_dbs
