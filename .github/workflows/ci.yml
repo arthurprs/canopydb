@@ -38,7 +38,10 @@ jobs:
 
   test-stable:
     name: Tests - Stable
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     env:
       RUST_TEST_THREADS: 1
     steps:
@@ -52,7 +55,10 @@ jobs:
 
   test-nightly:
     name: Tests - Nightly
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     env:
       RUST_TEST_THREADS: 1
     steps:
