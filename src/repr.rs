@@ -153,6 +153,7 @@ pub struct NodeHeader {
     pub key_prefix_len: u16,
     /// the level of the node, the leaf level is at level 0
     pub level: u8,
+    // TODO: remove fixed_* from the Node Header, keep them in TreeValue only
     pub fixed_key_len: i8,
     pub fixed_value_len: i8,
     #[debug(skip)]

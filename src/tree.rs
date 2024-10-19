@@ -30,12 +30,14 @@ pub(crate) const MAX_PREFIX_SIZE: usize = u16::MAX as usize;
 // * Max prefix length is 2**16 - 1
 // The max key length must allows fitting at least MIN_BRANCH_KEYS * 2 + 1 keys
 // into branch nodes and MIN_LEAF_KEYS * 2 keys in leaves, plus plenty of slack for header,
-// prefix and possibly small inline values (for leaves). Note that big values go into
-// overflow leaves so they do not influence this calculation significantly.
+// prefix and possibly small inline values (for leaves). Note that values larger than
+// MAX_INLINE_VALUE_LEN go into overflow leaves and do not influence this calculation.
 pub(crate) const MAX_KEY_SIZE: usize = 1 << 30; // 1GB
 pub(crate) const MAX_VALUE_SIZE: usize = 3 << 30; // 3GB
 pub(crate) const MAX_TREE_NAME_LEN: usize = MAX_KEY_SIZE;
-pub(crate) const MAX_INLINE_VALUE_LEN: usize = (PAGE_SIZE / 2) as usize;
+// Roughly PAGE_SIZE/2 (2048), but a little less as we still want to be able to fit
+// 2 small sized keys + 2 max-inline-len values in a leaf
+pub(crate) const MAX_INLINE_VALUE_LEN: usize = 1950;
 
 /// Database Tree Instance
 ///
