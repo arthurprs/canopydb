@@ -53,9 +53,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(unix)]
-use std::os::unix::prelude::AsRawFd;
-
 use crate::{
     allocator::{Allocator, MainAllocator},
     bytes::*,
@@ -243,13 +240,7 @@ impl DatabaseFile {
             .write(true)
             .open(path)?;
         // TODO: check if this needs to be done after each resize
-        #[cfg(unix)]
-        let _ = nix::fcntl::posix_fadvise(
-            file.as_raw_fd(),
-            0,
-            0,
-            nix::fcntl::PosixFadviseAdvice::POSIX_FADV_RANDOM,
-        );
+        utils::fadvise_read_ahead(&file, false)?;
         let file_len = file.metadata()?.len();
         let result = Self {
             use_mmap,
@@ -2770,20 +2761,9 @@ impl DatabaseInner {
             .name("Canopydb Checkpoint Flusher".into())
             .spawn(move || {
                 for (min, max) in flusher_rx {
-                    #[cfg(any(target_os = "linux", target_os = "android"))]
-                    unsafe {
-                        let sync_offset = min as u64 * PAGE_SIZE;
-                        let sync_len = (max - min + 1) as u64 * PAGE_SIZE;
-                        libc::sync_file_range(
-                            inner_.file.file.as_raw_fd(),
-                            sync_offset as _,
-                            sync_len as _,
-                            libc::SYNC_FILE_RANGE_WRITE,
-                        );
-                    }
-
-                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-                    let _ = inner.file.sync_data();
+                    let sync_offset = min as u64 * PAGE_SIZE;
+                    let sync_len = (max - min + 1) as u64 * PAGE_SIZE;
+                    let _ = utils::fsync_range(&inner_.file.file, sync_offset, sync_len);
                 }
             })
             .unwrap();

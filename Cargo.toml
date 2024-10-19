@@ -46,8 +46,6 @@ serde = { version = "1", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["fs", "mman"] }
-
-[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = { version = "0.2" }
 
 [profile.test]
