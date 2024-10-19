@@ -9,9 +9,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(unix)]
-use std::os::unix::prelude::AsRawFd;
-
 use smallvec::SmallVec;
 use triomphe::Arc;
 use zerocopy::*;
@@ -362,14 +359,8 @@ impl WalFile {
     fn file_for_read(&self) -> io::Result<Arc<FileWithPath>> {
         let file = self.file.clone();
         // Hint OS to perform liberal read ahead
-        // This may also affect the write file descriptor but it doesn't matter.
-        #[cfg(unix)]
-        let _ = nix::fcntl::posix_fadvise(
-            file.as_raw_fd(),
-            0,
-            0,
-            nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL,
-        );
+        // This may also affect the write file descriptor but maybe it doesn't matter.
+        utils::fadvise_read_ahead(&file, true)?;
         Ok(file)
     }
 
