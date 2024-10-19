@@ -201,7 +201,7 @@ impl EnvOptions {
         EnvOptions {
             wal_write_batch_tempfile_dir: path.clone(),
             path,
-            disable_fsync: false,
+            disable_fsync: option_env!("CANOPYDB_DISABLE_FSYNC_DEFAULT").is_some(),
             halt_callback: None,
             use_mmap: false,
             use_checksums: false,
