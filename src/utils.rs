@@ -47,7 +47,7 @@ pub fn fallocate(file: &File, len: u64) -> Result<(), io::Error> {
         };
         let res = libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &fstore);
         match nix::Error::result(res) {
-            Ok(_) => return Ok(()),
+            Ok(_) => (), // we still need to call ftruncate (set_len) below
             Err(nix::errno::Errno::ENOTSUP) => (),
             Err(e) => return Err(e.into()),
         }
