@@ -837,7 +837,7 @@ impl Database {
             wal_end: wal_start,
             ..Default::default()
         };
-        self.inner.file.ensure_file_size(true, 2)?;
+        self.inner.file.ensure_file_size(true, 2 * PAGE_SIZE)?;
         state.metapage.page_header.id = 0;
         self.inner.write_metapage(&state.metapage)?;
         state.metapage.page_header.id = 1;
