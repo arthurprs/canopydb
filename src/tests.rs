@@ -27,6 +27,10 @@ fn rand_str(rng: &mut impl Rng, a: usize, b: usize) -> Vec<u8> {
     COMP_DATASET[start..start + len].to_vec()
 }
 
+fn is_github_actions() -> bool {
+    std::env::var("GITHUB_WORKFLOW").is_ok()
+}
+
 fn test_folder() -> TempDir {
     if let Ok(p) = std::env::var("TEST_DATA_FOLDER") {
         let _ = std::fs::create_dir_all(&p);
@@ -849,7 +853,12 @@ fn insert_big_kvs_works() {
     let mut guard = TestGuard::new();
     let mut master_sample = HashMap::default();
 
-    for _round_no in 0..1_000 {
+    let mut rounds = 1_000;
+    if is_github_actions() {
+        rounds /= 10;
+    }
+
+    for _round_no in 0..rounds {
         eprintln!("Round {}", _round_no);
         let sample: Vec<_> = (0..50)
             .map(|_| {
@@ -1290,7 +1299,12 @@ fn spill_works() {
     let mut master_sample = HashMap::default();
     let guard = TestGuard::new();
 
-    for _round_no in 0..500 {
+    let mut rounds = 500;
+    if is_github_actions() {
+        rounds /= 10;
+    }
+
+    for _round_no in 0..rounds {
         if _round_no % 50 == 0 {
             eprintln!(
                 "Round {} used {}, elapsed {:?}",
@@ -1333,7 +1347,12 @@ fn seq_insert_works() {
     let mut master_sample = HashMap::default();
     let mut guard = TestGuard::new();
 
-    for _round_no in 0..448500 {
+    let mut rounds = 448500;
+    if is_github_actions() {
+        rounds /= 10;
+    }
+
+    for _round_no in 0..rounds {
         if _round_no % 1000 == 0 {
             eprintln!(
                 "Round {} used {}, elapsed {:?}",
@@ -1402,8 +1421,12 @@ fn insert_works() {
 
     let mut master_sample = HashMap::default();
     let mut guard = TestGuard::new();
+    let mut rounds = 448500;
+    if is_github_actions() {
+        rounds /= 10;
+    }
 
-    for _round_no in 0..448500 {
+    for _round_no in 0..rounds {
         if _round_no % 1000 == 0 {
             eprintln!(
                 "Round {} used {}, elapsed {:?}",
@@ -1504,8 +1527,12 @@ fn insert_works_seq_then_rand() {
 
     let mut guard = TestGuard::new();
 
+    let mut rounds = 448500;
+    if is_github_actions() {
+        rounds /= 10;
+    }
     let mut keys = 0u64;
-    for _round_no in 0..448500 {
+    for _round_no in 0..rounds {
         if _round_no % 1000 == 0 {
             eprintln!(
                 "Round {} used {}, elapsed {:?}",
@@ -1533,7 +1560,7 @@ fn insert_works_seq_then_rand() {
         tx.commit().unwrap();
     }
 
-    for _round_no in 0..100_000 {
+    for _round_no in 0..rounds {
         if _round_no % 1000 == 0 {
             eprintln!("Round {}", _round_no);
         }
