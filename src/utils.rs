@@ -37,8 +37,8 @@ pub fn fallocate(file: &File, len: u64) -> Result<(), io::Error> {
     }
     #[cfg(not(miri))]
     #[cfg(any(target_os = "macos", target_os = "ios"))]
-    {
-        let mut fstore = libc::fstore_t {
+    unsafe {
+        let fstore = libc::fstore_t {
             fst_flags: libc::F_ALLOCATEALL, // Allocate all requested space or no space at all.
             fst_posmode: libc::F_PEOFPOSMODE, // Allocate from the physical end of file.
             fst_offset: 0,
@@ -47,7 +47,7 @@ pub fn fallocate(file: &File, len: u64) -> Result<(), io::Error> {
         };
         let res = libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &fstore);
         match nix::Error::result(res) {
-            Ok(_) => return Ok(()),
+            Ok(_) => (), // we still need to call ftruncate (set_len) below
             Err(nix::errno::Errno::ENOTSUP) => (),
             Err(e) => return Err(e.into()),
         }
@@ -56,8 +56,9 @@ pub fn fallocate(file: &File, len: u64) -> Result<(), io::Error> {
     Ok(())
 }
 
+#[allow(unused_variables)]
 pub fn fadvise_wont_need(f: &File, len: u64) -> io::Result<()> {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     {
         let _ = nix::fcntl::posix_fadvise(
             f.as_raw_fd(),
@@ -66,6 +67,42 @@ pub fn fadvise_wont_need(f: &File, len: u64) -> io::Result<()> {
             nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
         );
     }
+    Ok(())
+}
+
+#[allow(unused_variables)]
+pub fn fadvise_read_ahead(file: &File, read_ahead: bool) -> io::Result<()> {
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    let _ = nix::fcntl::posix_fadvise(
+        file.as_raw_fd(),
+        0,
+        0,
+        if read_ahead {
+            nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL
+        } else {
+            nix::fcntl::PosixFadviseAdvice::POSIX_FADV_RANDOM
+        },
+    );
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    unsafe {
+        let _ = libc::fcntl(file.as_raw_fd(), libc::F_RDAHEAD, read_ahead as libc::c_int);
+    }
+    Ok(())
+}
+
+#[allow(unused_variables)]
+pub fn fsync_range(file: &File, sync_offset: u64, sync_len: u64) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    unsafe {
+        libc::sync_file_range(
+            file.as_raw_fd(),
+            sync_offset as _,
+            sync_len as _,
+            libc::SYNC_FILE_RANGE_WRITE,
+        );
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = file.sync_data();
     Ok(())
 }
 
@@ -91,7 +128,7 @@ pub fn atomic_file_write(path: &Path, contents: &[u8]) -> io::Result<()> {
 pub fn create_direct_io_file(path: &Path) -> io::Result<File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags((nix::fcntl::OFlag::O_DIRECT | nix::fcntl::OFlag::O_DSYNC).bits());
@@ -113,13 +150,13 @@ pub fn sync_dir(path: &Path) -> io::Result<()> {
     {
         // On windows we must use FILE_FLAG_BACKUP_SEMANTICS to get a handle to the file
         // From: https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea
-        const FILE_FLAG_BACKUP_SEMANTICS: i32 = 0x02000000;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
         use std::os::windows::fs::OpenOptionsExt;
         fs::OpenOptions::new()
             .read(true)
             .write(true)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(path)
+            .open(path)?
             .sync_all()
     }
 }
@@ -150,7 +187,7 @@ impl FileExt for std::fs::File {
     }
 
     #[cfg(windows)]
-    fn read_exact_at(&self, mut buf: &mut [u8], offset: u64) -> io::Result<()> {
+    fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
         fail::fail_point!("fread", |s| Err(io::Error::new(
             io::ErrorKind::Other,
             format!("failpoint fread {:?}", s)
@@ -223,11 +260,11 @@ impl FileExt for std::fs::File {
         let mut bufs: &mut [libc::iovec] = unsafe { std::mem::transmute(bufs) };
         while !bufs.is_empty() {
             let result = nix::Error::result(unsafe {
-                libc::pwritev64(
+                libc::pwritev(
                     self.as_raw_fd(),
                     bufs.as_ptr(),
                     std::cmp::min(bufs.len(), MAX_VECTORS) as libc::c_int,
-                    offset as libc::off64_t,
+                    offset as libc::off_t,
                 )
             })
             .map_err(io::Error::from);
@@ -260,7 +297,7 @@ impl FileExt for std::fs::File {
     }
 
     #[cfg(not(unix))]
-    fn write_all_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+    fn write_all_at(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
         fail::fail_point!("fwrite", |s| Err(io::Error::new(
             io::ErrorKind::Other,
             format!("failpoint fwrite {:?}", s)

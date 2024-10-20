@@ -113,11 +113,11 @@ env.group_commit([tx1, tx2], false).unwrap();
 
 Canopydb should be considered early stage software and new releases could be incompatible. Do not trust it with production data.
 
-Help is welcome to test and make it better, hopefully removing the disclaimer above. It's been a private testbed project for many years and rewritten a few times, so some corners may be sharp. For example, at some point it had an optional Bε-Tree mode, optimized for writes. It got removed during the push to turn the project public as the benefits didn't quite fit with the rest of the implementation (single writer, COW based implementation), all while adding undue complexity.
+Help is welcome to test and make it better, hopefully removing the disclaimer above. It's been an experimental project for many years and rewritten a few times. Even though it's reasonably well tested, there could be bugs and sharp API corners.
 
 ## Benchmarks
 
-See [benchmarks.md](benchmarks.md) file.
+See the [BENCHMARKS.md](https://github.com/arthurprs/canopydb/blob/master/BENCHMARKS.md) file in the repository.
 
 ## Comparison with other databases
 
