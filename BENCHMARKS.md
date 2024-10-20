@@ -11,7 +11,7 @@ If you have questions or suggestions for improvement, please open an issue and/o
 
 Benchmarks from <https://github.com/cberner/redb>, with [slight changes][redb commit]
 
-[redb commit]: https://github.com/cberner/redb
+[redb commit]: https://github.com/arthurprs/redb/tree/canopy-benchmarks
 
 * All operations are random (including bulk)
 * The workload fits in memory, and all commits are synchronous
@@ -86,7 +86,7 @@ How to reproduce:
 
 <https://github.com/marvin-j97/rust-storage-bench> from the author of [Fjall](https://github.com/fjall-rs/) with [changes][storage bench commit].
 
-[storage bench commit]: https://github.com/marvin-j97/rust-storage-bench
+[storage bench commit]: https://github.com/arthurprs/rust-storage-bench/tree/impl-canopy
 
 * Databases are configured with a 512MB page cache when applicable, and memory is limited to 4GB.
 * Values are 512B unless otherwise stated. The values are compressible, which is relevant for databases with compression.
