@@ -556,7 +556,6 @@ impl std::fmt::Debug for ByteSize {
 
 pub trait CellExt<T> {
     fn reset<F: FnOnce(T) -> T>(&self, f: F);
-    fn reset_with<F: FnOnce(&mut T)>(&self, f: F);
 }
 
 impl<T: Copy> CellExt<T> for std::cell::Cell<T> {
@@ -564,13 +563,6 @@ impl<T: Copy> CellExt<T> for std::cell::Cell<T> {
     fn reset<F: FnOnce(T) -> T>(&self, f: F) {
         let mut v = self.get();
         v = f(v);
-        self.set(v);
-    }
-
-    #[inline]
-    fn reset_with<F: FnOnce(&mut T)>(&self, f: F) {
-        let mut v = self.get();
-        f(&mut v);
         self.set(v);
     }
 }

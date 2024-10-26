@@ -66,7 +66,7 @@ use crate::{
     pagetable::{Item, PageTable},
     repr::*,
     shim::{
-        parking_lot::{Condvar, Mutex, RawMutex, RwLock},
+        parking_lot::{Condvar, Mutex, RawMutex, RawRwLock, RwLock},
         sync::{atomic, mpsc, Arc as StdArc, Weak as StdWeak},
         thread,
     },
@@ -89,7 +89,8 @@ type HashSet<K> = hash_set::HashSet<K, foldhash::fast::RandomState>;
 type HashMap<K, V> = hash_map::HashMap<K, V, foldhash::fast::RandomState>;
 
 use env::EnvironmentHandle;
-use lock_api::ArcMutexGuard;
+use lock_api::{ArcMutexGuard, ArcRwLockReadGuard, ArcRwLockWriteGuard};
+use rand::Rng;
 use smallvec::SmallVec;
 use triomphe::Arc;
 use zerocopy::*;
@@ -118,8 +119,12 @@ bitflags::bitflags! {
         const DONE = 0b00000001;
         /// Set if the txn altered anything
         const DIRTY = 0b00000010;
-        /// Set for write transactions
+        /// Set for all kinds of write transactions
         const WRITE_TX = 0b00000100;
+        /// Set for multi write transactions
+        const MULTI_WRITE_TX = 0b00001000;
+        /// Set when the page table is dirty and may need cleanup on rollback
+        const PAGE_TABLE_DIRTY = 0b00010000;
         /// Set for checkpoint transactions
         const CHECKPOINT_TX = 0b00001000;
     }
@@ -169,8 +174,13 @@ pub struct Transaction {
     wal_write_batch: RefCell<Option<WriteBatch>>,
     /// Scratch space
     scratch_buffer: RefCell<Vec<u8>>,
-    /// Mutex held by the unique write tx
-    write_lock: Option<ArcMutexGuard<RawMutex, CachedWriteState>>,
+    /// held by the exclusive write tx
+    exclusive_write_lock: Option<ArcRwLockWriteGuard<RawRwLock, CachedWriteState>>,
+    /// held by a multi writer tx
+    multi_write_lock: Option<ArcRwLockReadGuard<RawRwLock, CachedWriteState>>,
+    /// held by a multi writer tx in the commit phase
+    multi_write_commit_lock: Option<ArcMutexGuard<RawMutex, ()>>,
+    tracked_transaction: Option<TxId>,
     /// Handle to the environment, set if this is an user transaction and the Database is open
     env_handle: Option<EnvironmentHandle>,
 }
@@ -184,7 +194,8 @@ impl std::fmt::Debug for Transaction {
             .field("nodes", &self.nodes)
             .field("done", &self.flags.get().contains(TF::DONE))
             .field("write_batch", &self.wal_write_batch)
-            .field("write_lock", &self.write_lock.is_some())
+            .field("exclusive_write_lock", &self.exclusive_write_lock.is_some())
+            .field("multi_write_lock", &self.multi_write_lock.is_some())
             .finish()
     }
 }
@@ -381,7 +392,8 @@ struct DatabaseInner {
     old_snapshots: Mutex<BTreeMap<TxId, Freelist>>,
     checkpoint_lock: Mutex<()>,
     running_stats: Mutex<RunningStats>,
-    write_lock: StdArc<Mutex<CachedWriteState>>,
+    write_lock: StdArc<RwLock<CachedWriteState>>,
+    multi_writer_commit_lock: StdArc<Mutex<()>>,
     /// Open transactions other than the unique write transaction
     /// This is a sorted Vec to avoid hitting the allocator when the collections len fluctuates (0-1-0-1..)
     /// Furthermore, min lookup are push-last are common, which more than make up for small linear removals.
@@ -645,6 +657,7 @@ impl Database {
             page_table: Default::default(),
             checkpoint_lock: Default::default(),
             write_lock: Default::default(),
+            multi_writer_commit_lock: Default::default(),
             old_snapshots: Default::default(),
             allocator: Default::default(),
             buffers_free: Default::default(),
@@ -705,7 +718,7 @@ impl Database {
     #[cfg(any(fuzzing, test))]
     pub fn validate_free_space(&self) -> Result<(), Error> {
         let _checkpoint_lock = self.inner.checkpoint_lock.lock();
-        let _write_lock = self.inner.write_lock.lock();
+        let _write_lock = self.inner.write_lock.write();
         // We are using a read tnx to avoid dealing with the write txn reservations.
         // Furthermore, since we're holding checkpoint lock it must be a non-user txn to avoid
         // deadlocks with major operations such as compaction.
@@ -930,7 +943,7 @@ impl Database {
     /// This property is automatically enforced by the Database.
     /// The returned transaction must be committed for the changes to be persisted.
     pub fn begin_write(&self) -> Result<WriteTransaction, Error> {
-        let mut tx = Transaction::new_write(&self.inner, true)?;
+        let mut tx = Transaction::new_multi_write(&self.inner, true)?;
         tx.release_free_buffers(
             tx.inner.page_table.spans_used()
                 >= self.inner.opts.throttle_memory_limit / PAGE_SIZE as usize,
@@ -942,7 +955,7 @@ impl Database {
             drop(tx);
             info!("Throttling write tx");
             thread::sleep(Duration::from_micros(100));
-            tx = Transaction::new_write(&self.inner, true)?;
+            tx = Transaction::new_multi_write(&self.inner, true)?;
             while {
                 tx.release_free_buffers(true);
                 tx.inner.page_table.spans_used()
@@ -957,17 +970,15 @@ impl Database {
                 thread::sleep(Duration::from_micros(100));
                 // Wait for the ongoing checkpoint to finish.
                 self.inner.wait_checkpoint();
-                tx = Transaction::new_write(&self.inner, true)?;
+                tx = Transaction::new_multi_write(&self.inner, true)?;
             }
             debug!("Resuming write tx after throttling");
         }
         if tx.inner.opts.use_wal {
             let mut wb = tx
-                .write_lock
+                .exclusive_write_lock
                 .as_mut()
-                .unwrap()
-                .wal_write_batch
-                .take()
+                .and_then(|s| s.wal_write_batch.take())
                 .unwrap_or_else(|| WriteBatch::new(self.inner.env.opts.clone()));
             wb.push_db(self.inner.env_db_id)?;
             tx.wal_write_batch = Some(wb).into();
@@ -1014,7 +1025,7 @@ impl Database {
     pub fn compact(&self) -> Result<(), Error> {
         info!("Compacting database {}", self.inner.env_db_name);
         let checkpoint_lock = self.inner.checkpoint_lock.lock();
-        let write_lock = self.inner.write_lock.lock();
+        let write_lock = self.inner.write_lock.write();
         let mut curr_file_size = self.inner.file.file_len();
         // With both checkpoint and write locks we can get a sense of the data file size
         const MIN_SIZE_FOR_COMPACTION: u64 = PAGE_SIZE * 100;
@@ -1189,11 +1200,10 @@ impl WriteTransaction {
         }
         guard.disarm();
         let name: Arc<[u8]> = name.into();
-        let value = options.to_value(self.state.get().metapage.next_tree_id);
+        let value = options.to_value(rand::thread_rng().gen());
         self.trees
             .borrow_mut()
             .insert(name.clone(), TreeState::InUse { value });
-        self.state.reset_with(|s| s.metapage.next_tree_id += 1);
         Ok(Tree {
             name: Some(name),
             value,
@@ -1207,7 +1217,7 @@ impl WriteTransaction {
     ///
     /// Equivalent to [Self::commit_with] with the sync argument from [DbOptions::default_commit_sync]
     #[inline]
-    pub fn commit(self) -> Result<(), Error> {
+    pub fn commit(self) -> Result<TxId, Error> {
         let sync = self.inner.opts.default_commit_sync;
         self.commit_with(sync)
     }
@@ -1218,16 +1228,16 @@ impl WriteTransaction {
     /// Note that transactions that commiting transactions that aren't dirty (see [WriteTransaction::is_dirty])
     /// are equivalent to a rollback (nothing is affected, e.g. the next WriteTransaction will have the
     /// same Transaction Id).
-    pub fn commit_with(mut self, sync: bool) -> Result<(), Error> {
+    pub fn commit_with(mut self, sync: bool) -> Result<TxId, Error> {
         debug_assert!(self.is_write_tx());
         if !self.is_dirty() {
             trace!("Transaction isn't dirty, commit is a rollback");
-            return self.rollback();
+            return self.0.do_rollback().map(|_| self.tx_id());
         }
         self.0.commit_start()?;
         self.0.commit_wal(sync)?;
         self.0.commit_finish()?;
-        Ok(())
+        Ok(self.tx_id())
     }
 
     /// Rolls back the transaction, discarding any changes
@@ -1295,8 +1305,7 @@ impl Drop for Transaction {
         if self.is_write_or_checkpoint_txn() && !self.is_done() {
             let _ = self.do_rollback();
         }
-        if !self.is_write_tx() {
-            let tx_id = self.state.get_mut().metapage.tx_id;
+        if let Some(tx_id) = self.tracked_transaction {
             let earliest_open_read_tx;
             let earliest_tx_needed;
             {
@@ -1356,7 +1365,7 @@ impl Transaction {
         let mut write_lock;
         let mut state;
         loop {
-            write_lock = Mutex::lock_arc(&inner.write_lock);
+            write_lock = inner.write_lock.write_arc();
             state = *inner.state.lock();
             state.check_halted()?;
             if !user_txn || !state.block_user_transactions {
@@ -1364,13 +1373,14 @@ impl Transaction {
             }
             drop(write_lock);
             debug!("new_write waiting for user_transactions to be allowed");
+            // FIXME: this might never get waken
             inner
                 .transactions_condvar
                 .wait(&mut inner.transactions.lock());
         }
         state.metapage.tx_id += 1;
         trace!("new_write {}", state.metapage.tx_id);
-        let allocator = Allocator::new_transaction(inner)?;
+        let allocator = Allocator::new_transaction(inner, false)?;
         let nodes = write_lock
             .nodes
             .take()
@@ -1384,10 +1394,68 @@ impl Transaction {
             state: Cell::new(state),
             trees: RefCell::new(trees),
             nodes: RefCell::new(nodes),
+            tracked_transaction: Default::default(),
             nodes_spilled_span: Default::default(),
             wal_write_batch: Default::default(),
             scratch_buffer: RefCell::new(mem::take(&mut write_lock.scratch_buffer)),
-            write_lock: Some(write_lock),
+            exclusive_write_lock: Some(write_lock),
+            multi_write_lock: None,
+            multi_write_commit_lock: None,
+            env_handle: user_txn.then(|| inner.open.lock().clone()).flatten(),
+        }))
+    }
+
+    fn new_multi_write(
+        inner: &SharedDatabaseInner,
+        user_txn: bool,
+    ) -> Result<WriteTransaction, Error> {
+        let mut transactions;
+        let mut write_lock;
+        let mut state;
+        loop {
+            write_lock = inner.write_lock.read_arc();
+            transactions = inner.transactions.lock();
+            state = *inner.state.lock();
+            state.check_halted()?;
+            if !user_txn || !state.block_user_transactions {
+                break;
+            }
+            drop(write_lock);
+            debug!("new_multi_write waiting for user_transactions to be allowed");
+            inner.transactions_condvar.wait(&mut transactions);
+            drop(transactions);
+        }
+        match transactions.last_mut() {
+            Some(l) if l.tx_id == state.metapage.tx_id => l.ref_count += 1,
+            _ => {
+                transactions.push(OpenTxn {
+                    tx_id: state.metapage.tx_id,
+                    ref_count: 1,
+                    earliest_snapshot_tx_id: state.metapage.snapshot_tx_id,
+                });
+            }
+        }
+        drop(transactions);
+        let allocator = Allocator::new_transaction(inner, true)?;
+        state.metapage.tx_id += 1;
+        trace!("new_multi_write {}", state.metapage.tx_id);
+        let nodes = new_dirty_cache(&inner.opts);
+        let trees = HashMap::default();
+        Ok(WriteTransaction(Transaction {
+            flags: (TF::MULTI_WRITE_TX | TF::WRITE_TX).into(),
+            trap: Default::default(),
+            allocator: RefCell::new(allocator),
+            inner: ManuallyDrop::new(inner.clone()),
+            state: Cell::new(state),
+            trees: RefCell::new(trees),
+            nodes: RefCell::new(nodes),
+            nodes_spilled_span: Default::default(),
+            wal_write_batch: Default::default(),
+            scratch_buffer: Default::default(),
+            tracked_transaction: Some(state.metapage.tx_id - 1),
+            exclusive_write_lock: None,
+            multi_write_lock: Some(write_lock),
+            multi_write_commit_lock: None,
             env_handle: user_txn.then(|| inner.open.lock().clone()).flatten(),
         }))
     }
@@ -1409,10 +1477,9 @@ impl Transaction {
             debug!("new_read waiting for user_transactions to be allowed");
             inner.transactions_condvar.wait(&mut transactions);
         }
-        match transactions.binary_search_by_key(&state.metapage.tx_id, |ot| ot.tx_id) {
-            Ok(idx) => transactions[idx].ref_count += 1,
-            Err(idx) => {
-                debug_assert_eq!(idx, transactions.len());
+        match transactions.last_mut() {
+            Some(l) if l.tx_id == state.metapage.tx_id => l.ref_count += 1,
+            _ => {
                 transactions.push(OpenTxn {
                     tx_id: state.metapage.tx_id,
                     ref_count: 1,
@@ -1431,7 +1498,10 @@ impl Transaction {
             nodes: RefCell::new(void_dirty_cache()),
             nodes_spilled_span: Default::default(),
             wal_write_batch: None.into(),
-            write_lock: None,
+            exclusive_write_lock: None,
+            multi_write_lock: None,
+            multi_write_commit_lock: None,
+            tracked_transaction: Some(state.metapage.tx_id),
             allocator: RefCell::new(Allocator::default()),
             scratch_buffer: Default::default(),
             env_handle: user_txn.then(|| inner.open.lock().clone()).flatten(),
@@ -2026,8 +2096,8 @@ impl Transaction {
         trace!("Rolling back txn {}", self.tx_id());
         // failures after setting DONE are fatal
         self.flags.get_mut().insert(TF::DONE);
-        if self.is_dirty() && self.is_write_tx() {
-            // if we failed in commit dirty we may have cleanup to do here
+        // if we failed in commit dirty we may have cleanup to do here
+        if self.flags.get_mut().contains(TF::PAGE_TABLE_DIRTY) {
             self.inner.page_table.clear_latest_tx(self.tx_id());
         }
         // even if it's clean it may have reservations
@@ -2042,6 +2112,7 @@ impl Transaction {
     }
 
     fn commit_dirty_nodes(&mut self) -> Result<(), Error> {
+        self.flags.get_mut().insert(TF::PAGE_TABLE_DIRTY);
         let tx_id = self.tx_id();
         let mut nodes = self.nodes.borrow_mut();
         let allocator = &mut self.allocator.borrow_mut();
@@ -2213,6 +2284,10 @@ impl Transaction {
         self.flags.get().contains(TF::WRITE_TX)
     }
 
+    fn is_multi_write_tx(&self) -> bool {
+        self.flags.get().contains(TF::MULTI_WRITE_TX)
+    }
+
     fn is_done(&self) -> bool {
         self.flags.get().contains(TF::DONE)
     }
@@ -2223,24 +2298,79 @@ impl Transaction {
             .intersects(TF::CHECKPOINT_TX | TF::WRITE_TX)
     }
 
+    fn check_conflicts(&mut self) -> bool {
+        let tx_id = self.tx_id();
+        for (&page_id, _) in self.nodes.get_mut().iter() {
+            if !self.inner.page_table.is_latest_page(tx_id, page_id) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn commit_start(&mut self) -> Result<(), Error> {
         debug_assert!(self.is_write_tx());
+        if self.is_multi_write_tx() {
+            trace!(
+                "MultiWrite Commit start {}",
+                self.state.get_mut().metapage.tx_id
+            );
+            self.multi_write_commit_lock = Some(self.inner.multi_writer_commit_lock.lock_arc());
+            let mut latest_state = *self.inner.state.lock();
+            latest_state.metapage.tx_id += 1;
+            if latest_state.metapage.tx_id == self.state.get_mut().metapage.tx_id {
+                self.multi_write_commit_lock = None;
+                self.flags.get_mut().remove(TF::MULTI_WRITE_TX);
+            } else if self.check_conflicts() {
+                return Err(Error::WriteConflict);
+            } else {
+                self.state.get_mut().metapage = latest_state.metapage;
+            }
+        }
+
         trace!("Commit start {}", self.state.get_mut().metapage.tx_id);
         self.trap.check()?;
 
         let mut tx_trees = mem::take(self.trees.get_mut());
         let mut trees_tree = self.get_trees_tree();
-        for (tree_id, tree_state) in &mut tx_trees {
+        for (tree_name, tree_state) in &mut tx_trees {
             match tree_state {
+                TreeState::Available { value, dirty } if !self.is_multi_write_tx() => {
+                    if mem::take(dirty) {
+                        value.key_delta = 0;
+                        trees_tree.insert(tree_name, value.as_bytes())?;
+                    }
+                }
                 TreeState::Available { value, dirty } => {
-                    if *dirty {
-                        *dirty = false;
-                        // TODO: this increases cpu usage significantly for small transactions
-                        trees_tree.insert(tree_id, value.as_bytes())?;
+                    if mem::take(dirty) {
+                        let existing = trees_tree.get(tree_name)?.map(|v| {
+                            *Ref::<_, TreeValue>::new_unaligned(v.as_ref())
+                                .unwrap()
+                                .into_ref()
+                        });
+                        let mut needs_update;
+                        let mut merged = existing.unwrap_or(*value);
+                        if existing.is_some() {
+                            if merged.id != value.id {
+                                return Err(Error::WriteConflict);
+                            }
+                            needs_update = value.key_delta != 0;
+                            if self.nodes.borrow().peek(&{ value.root }).is_some() {
+                                needs_update = true;
+                                merged.root = value.root;
+                            }
+                            merged.num_keys = merged.num_keys.wrapping_add_signed(value.key_delta);
+                        } else {
+                            needs_update = true;
+                        }
+                        if needs_update {
+                            merged.key_delta = 0;
+                            trees_tree.insert(tree_name, merged.as_bytes())?;
+                        }
                     }
                 }
                 TreeState::Deleted => {
-                    trees_tree.delete(tree_id)?;
+                    trees_tree.delete(tree_name)?;
                 }
                 TreeState::InUse { .. } => unreachable!(),
             }
@@ -2316,9 +2446,8 @@ impl Transaction {
             state.spilled_total_span += self.nodes_spilled_span.get();
         }
 
-        {
+        if let Some(mut write_lock) = self.exclusive_write_lock.take() {
             // Release write lock and move the write state into it
-            let mut write_lock = self.write_lock.take().unwrap();
             // TODO: consider limiting the size of some of these
             write_lock.nodes = Some(mem::replace(self.nodes.get_mut(), void_dirty_cache()));
             write_lock.trees = Some(mem::take(self.trees.get_mut()));
@@ -2327,6 +2456,9 @@ impl Transaction {
                 wb.clear();
                 wb
             });
+        } else {
+            self.multi_write_lock = None;
+            self.multi_write_commit_lock = None;
         }
 
         if self.nodes_spilled_span.get() != 0 {
@@ -3012,7 +3144,7 @@ impl DatabaseInner {
 
         let result = (|| -> Result<Option<WriteTransaction>, Error> {
             debug!("Acquiring checkpoint start write lock");
-            let write_lock = inner.write_lock.lock();
+            let write_lock = inner.write_lock.write();
             let mut txn = Transaction::new_read(inner, false)?;
             let txn_state = txn.state.get();
             txn_state.check_halted()?;
@@ -3060,7 +3192,7 @@ impl DatabaseInner {
             );
             // TODO: maybe reserve half of free on start? to avoid this in some cases?
             debug!("Acquiring checkpoint reservation write lock");
-            let _write_lock = inner.write_lock.lock();
+            let _write_lock = inner.write_lock.write();
             txn.0
                 .allocator
                 .get_mut()
@@ -3194,7 +3326,7 @@ impl DatabaseInner {
 
         debug!("Acquiring checkpoint end write lock");
         {
-            let _w = inner.write_lock.lock();
+            let _write_lock = inner.write_lock.write();
             let mut state = inner.state.lock();
 
             // Redirected buffer pages must be freed at the _next_ tx as this tx
@@ -3522,7 +3654,8 @@ type DirtyNodes = quick_cache::unsync::Cache<
     PageId,
     TxNode,
     DirtyNodeWeighter,
-    foldhash::fast::RandomState,
+    // Using quality for the time being to avoid degenerate cases https://github.com/rust-lang/hashbrown/issues/577
+    foldhash::quality::RandomState,
     DirtyNodeLifecycle,
 >;
 

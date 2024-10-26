@@ -11,7 +11,7 @@ fn main() {
     let mut options = EnvOptions::new(_dir.path());
     // all databases in the same environment will share this 1GB cache
     options.page_cache_size = 1024 * 1024 * 1024;
-    let env = Environment::new(_dir.path()).unwrap();
+    let env = Environment::with_options(options).unwrap();
 
     let db1 = env.get_or_create_database("db1").unwrap();
     let db2 = env.get_or_create_database("db2").unwrap();

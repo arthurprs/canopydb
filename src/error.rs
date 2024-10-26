@@ -22,6 +22,7 @@ pub enum Error {
     EnvironmentLocked,
     WriteTransactionRequired,
     CantCompact,
+    WriteConflict,
 }
 
 impl Error {
@@ -57,6 +58,7 @@ impl Error {
             Self::EnvironmentLocked => Self::EnvironmentLocked,
             Self::WriteTransactionRequired => Self::WriteTransactionRequired,
             Self::CantCompact => Self::CantCompact,
+            Self::WriteConflict => Self::WriteConflict,
         }
     }
 }

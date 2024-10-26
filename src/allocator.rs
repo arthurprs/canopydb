@@ -120,10 +120,10 @@ impl MainAllocator {
 }
 
 impl Allocator {
+    const MULTI_W_INITIAL_ALLOC: PageId = 10;
     const ALLOCATION_BATCH: PageId = 100;
 
-    pub fn new_transaction(inner: &DatabaseInner) -> Result<Allocator, Error> {
-        let is_checkpointing = inner.checkpoint_lock.is_locked();
+    pub fn new_transaction(inner: &DatabaseInner, multi: bool) -> Result<Allocator, Error> {
         let mut result = Self {
             is_checkpointer: false,
             main: Some(inner.allocator.clone()),
@@ -132,12 +132,17 @@ impl Allocator {
         let mut main = inner.allocator.lock();
         result.main_next_page_id = main.next_page_id;
         result.main_next_indirection_id = main.next_indirection_id;
-        if is_checkpointing {
-            let bulk_span = (main.free.len() / 2)
-                .min((inner.opts.checkpoint_target_size / PAGE_SIZE as usize) as PageId);
-            result.free = main.free.bulk_allocate(bulk_span, false);
+        if multi {
+            result.free = main.free.bulk_allocate(Self::MULTI_W_INITIAL_ALLOC, true);
         } else {
-            mem::swap(&mut result.free, &mut main.free);
+            let is_checkpointing = inner.checkpoint_lock.is_locked();
+            if is_checkpointing {
+                let bulk_span = (main.free.len() / 2)
+                    .min((inner.opts.checkpoint_target_size / PAGE_SIZE as usize) as PageId);
+                result.free = main.free.bulk_allocate(bulk_span, false);
+            } else {
+                mem::swap(&mut result.free, &mut main.free);
+            }
         }
         result.all_allocations.merge(&result.free)?;
         Ok(result)

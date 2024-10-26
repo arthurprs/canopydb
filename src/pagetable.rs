@@ -96,7 +96,8 @@ impl From<Item> for InnerItem {
 #[derive(Debug, Default)]
 #[repr(C, align(64))]
 pub(crate) struct PageTable {
-    table: DashMap<PageId, SmallVec<(TxId, InnerItem), 1>, foldhash::fast::RandomState>,
+    // Using quality for the time being to avoid degenerate cases https://github.com/rust-lang/hashbrown/issues/577
+    table: DashMap<PageId, SmallVec<(TxId, InnerItem), 1>, foldhash::quality::RandomState>,
     spans_used: AtomicIsize,
 }
 
@@ -241,6 +242,14 @@ impl PageTable {
     pub fn get(&self, tx_id: TxId, page_id: PageId) -> Option<(TxId, Item)> {
         trace!("get tx_id {tx_id} page {page_id}");
         self.peek(tx_id, page_id, |from, item| Some((from, item.to_item()?)))
+    }
+
+    pub fn is_latest_page(&self, tx_id: TxId, page_id: PageId) -> bool {
+        if let Some(values) = self.table.get(&page_id) {
+            values.last().map_or(true, |&(from, _)| from < tx_id)
+        } else {
+            true
+        }
     }
 
     pub fn is_page_from_snapshot(

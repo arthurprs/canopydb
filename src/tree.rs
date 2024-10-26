@@ -84,8 +84,8 @@ pub struct Tree<'tx> {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TreeState {
     Available { value: TreeValue, dirty: bool },
-    Deleted,
     InUse { value: TreeValue },
+    Deleted,
 }
 
 enum MutateResult {
@@ -168,6 +168,7 @@ impl<'tx> Tree<'tx> {
             Ordering::Greater => self.value.num_keys += delta as u64,
             Ordering::Equal => return,
         }
+        self.value.key_delta += delta;
         self.dirty = true;
     }
 
