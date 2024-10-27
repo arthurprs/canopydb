@@ -266,6 +266,7 @@ impl std::fmt::Debug for TreeValue {
             .field("id", &{ self.id })
             .field("root", &{ self.root })
             .field("num_keys", &{ self.num_keys })
+            .field("key_delta", &{ self.key_delta })
             .field("nodes_compressed", &self.nodes_compressed)
             .field("overflow_compressed", &self.overflow_compressed)
             .field("min_branch_node_pages", &self.min_branch_node_pages)

@@ -633,7 +633,7 @@ impl<'tx> Tree<'tx> {
             match Self::insert_kv(tree, prefix, &mut node, search, full_key, value)? {
                 Ok(()) => {
                     trace!(
-                        "inserted {:?} in leaf {} {:?}, num_keys {}",
+                        "inserted `{:?}` in leaf {} {:?}, num_keys {}",
                         &EscapedBytes(full_key),
                         node.id(),
                         search,
@@ -649,7 +649,7 @@ impl<'tx> Tree<'tx> {
         } else if let Ok(idx) = search {
             tree.inc_num_keys(-1);
             trace!(
-                "delete {:?} in leaf {} pos {:?}",
+                "delete `{:?}` in leaf {} pos {:?}",
                 &EscapedBytes(full_key),
                 node.id(),
                 search

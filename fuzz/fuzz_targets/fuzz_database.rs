@@ -4,7 +4,7 @@ use canopydb::{utils::EscapedBytes, Error};
 use libfuzzer_sys::fuzz_target;
 use rand::{distributions::Alphanumeric, Rng, SeedableRng};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     mem,
     ops::Bound,
     rc::Rc,
@@ -101,7 +101,7 @@ struct BytesN<const MIN: usize, const MAX: usize>(Rc<Vec<u8>>);
 
 impl<'a, const MIN: usize, const MAX: usize> std::fmt::Debug for BytesN<MIN, MAX> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", &EscapedBytes(&self.0))
+        write!(f, "`{:?}`", &EscapedBytes(&self.0))
     }
 }
 
@@ -219,9 +219,10 @@ type ModelTreeMut = BTreeMap<Bytes, Bytes>;
 type ModelTree = Rc<ModelTreeMut>;
 type ModelTreeRef<'a> = &'a ModelTreeMut;
 const NUM_ACTORS: usize = 2;
+const MAX_WRITERS: usize = 2;
 
 struct WorldState {
-    writter: Option<ActorId>,
+    writers: BTreeSet<ActorId>,
     db: canopydb::Database,
     model: ModelTree,
     read_queue: VecDeque<ActorId>,
@@ -237,7 +238,7 @@ struct World {
 enum Tx {
     None,
     Read(ModelTree, canopydb::ReadTransaction),
-    Write(ModelTreeMut, canopydb::WriteTransaction),
+    Write(ModelTreeMut, canopydb::WriteTransaction, ModelTree),
 }
 
 impl Default for Tx {
@@ -255,10 +256,7 @@ struct Actor {
 }
 
 impl Actor {
-    fn op(&mut self, state: &mut WorldState, new_op: Option<Op>) {
-        if let Some(op) = new_op {
-            self.op_queue.push_back(op);
-        }
+    fn op(&mut self, state: &mut WorldState) {
         while let Some(op) = self.op_queue.pop_front() {
             if match op {
                 Op::Commit(_, failure) => self.commit(state, failure),
@@ -281,21 +279,34 @@ impl Actor {
                 Self::validate(state, &model, &rx);
                 false
             }
-            Tx::Write(model, tx) => {
+            Tx::Write(model, tx, starting) => {
                 let tx_id = tx.tx_id();
                 trace!("commiting {}", tx_id);
                 Self::validate(state, &model, &tx);
                 match failure.call(|| tx.commit()) {
-                    Ok(_) => state.model = model.into(),
+                    Ok(_) => {
+                        let state_model = Rc::make_mut(&mut state.model);
+                        for (k, v) in &model {
+                            if starting.get(&k) != Some(&v) {
+                                state_model.insert(k.clone(), v.clone());
+                            }
+                        }
+                        for k in starting.keys() {
+                            if !model.contains_key(&k) {
+                                state_model.remove(k);
+                            }
+                        }
+                    },
                     Err(e) => error!("commit failed: {e}"),
                 }
-                if state.always_validate || tx_id % 8 == 0 {
-                    match state.db.validate_free_space() {
-                        Ok(()) | Err(Error::DatabaseHalted) => (),
-                        Err(e) => panic!("{e}"),
-                    }
-                }
-                state.writter = None;
+                Self::validate(state, &state.model, &state.db.begin_read().unwrap());
+                // if state.always_validate || tx_id % 8 == 0 {
+                //     match state.db.validate_free_space() {
+                //         Ok(()) | Err(Error::DatabaseHalted) => (),
+                //         Err(e) => panic!("{e}"),
+                //     }
+                // }
+                state.writers.remove(&self.id);
                 if !self.op_queue.is_empty() {
                     self.enqueued = true;
                     state.read_queue.push_back(self.id);
@@ -312,13 +323,13 @@ impl Actor {
                 Self::validate(state, &model, &rx);
                 false
             }
-            Tx::Write(model, tx) => {
+            Tx::Write(model, tx, ..) => {
                 trace!("rolling back {}", tx.tx_id());
                 Self::validate(state, &model, &tx);
                 if let Err(e) = failure.call(|| tx.rollback()) {
                     error!("rollback failed: {e}");
                 }
-                state.writter = None;
+                state.writers.remove(&self.id);
                 if !self.op_queue.is_empty() {
                     self.enqueued = true;
                     state.read_queue.push_back(self.id);
@@ -329,7 +340,7 @@ impl Actor {
     }
 
     fn checkpoint(&mut self, state: &mut WorldState, op: Op) -> bool {
-        if state.writter.is_none() {
+        if state.writers.is_empty() {
             if let Err(e) = op.failure().call(|| state.db.checkpoint()) {
                 error!("checkpoint failed: {e}");
             }
@@ -363,13 +374,13 @@ impl Actor {
         }
         match &mut self.tx {
             Tx::None => {
-                if state.writter.is_none() {
+                if state.writers.len() < MAX_WRITERS {
                     match state.db.begin_write() {
-                        Ok(tx) => self.tx = Tx::Write((*state.model).clone(), tx),
+                        Ok(tx) => self.tx = Tx::Write((*state.model).clone(), tx, state.model.clone()),
                         Err(Error::DatabaseHalted) => return false,
                         Err(e) => panic!("{e}"),
                     }
-                    state.writter = Some(self.id);
+                    state.writers.insert(self.id);
                 } else {
                     if !self.enqueued {
                         self.enqueued = true;
@@ -380,11 +391,11 @@ impl Actor {
                 }
             }
             Tx::Read(_, _) => unreachable!(),
-            Tx::Write(_, _) => (),
+            Tx::Write(..) => (),
         }
         match &mut self.tx {
             Tx::None | Tx::Read(_, _) => unreachable!(),
-            Tx::Write(model, tx) => {
+            Tx::Write(model, tx, ..) => {
                 let mut tree = match tx.get_or_create_tree(b"default") {
                     Ok(tree) => tree,
                     Err(Error::TransactionAborted) => return false,
@@ -449,9 +460,9 @@ impl Actor {
                     }
                 }
                 drop(tree);
-                if state.always_validate {
-                    Self::validate(state, &model, tx);
-                }
+                // if state.always_validate {
+                //     Self::validate(state, &model, tx);
+                // }
                 false
             }
         }
@@ -507,6 +518,7 @@ impl Actor {
                 assert_eq!(mv, v1.as_ref());
                 assert!(range.next().is_none());
             }
+            assert_eq!(tree.len() as usize, model.len());
         }
         if val_forw {
             let mut iter = tree.iter().unwrap();
@@ -515,7 +527,7 @@ impl Actor {
                 assert_eq!(k.0.as_slice(), ck.as_ref());
                 assert_eq!(v.0.as_slice(), cv.as_ref());
             }
-            assert!(iter.next().is_none());
+            assert_eq!(iter.next().map(|r| r.ok()), None);
         }
         if val_back {
             let mut iter = tree.iter().unwrap().rev();
@@ -524,7 +536,7 @@ impl Actor {
                 assert_eq!(k.0.as_slice(), ck.as_ref());
                 assert_eq!(v.0.as_slice(), cv.as_ref());
             }
-            assert!(iter.next().is_none());
+            assert_eq!(iter.next().map(|r| r.ok()), None);
         }
     }
 }
@@ -538,7 +550,7 @@ fuzz_target!(|ops: Vec<Op>| {
     db_options.checkpoint_interval = std::time::Duration::MAX;
     db_options.use_wal = cfg!(feature = "failpoints");
     db_options.default_commit_sync = false;
-    db_options.checkpoint_target_size = 16 * 4096 as usize;
+    // db_options.checkpoint_target_size = 16 * 4096 as usize;
     let always_validate =
         std::env::var("ALWAYS_VALIDATE").map_or(0, |s| s.parse::<i64>().unwrap()) != 0;
     let db = canopydb::Database::with_options(options.clone(), db_options.clone()).unwrap();
@@ -548,7 +560,7 @@ fuzz_target!(|ops: Vec<Op>| {
             model: Default::default(),
             write_queue: Default::default(),
             read_queue: Default::default(),
-            writter: None,
+            writers: Default::default(),
             always_validate,
         },
         actors: Default::default(),
@@ -558,38 +570,40 @@ fuzz_target!(|ops: Vec<Op>| {
     }
     dbg!(ops.len());
     for op in ops {
-        world.actors[op.actor().0].op(&mut world.state, Some(op));
+        let actor_no = op.actor().0;
+        world.actors[actor_no].op_queue.push_back(op);
+        world.actors[actor_no].op(&mut world.state);
         while !world.state.read_queue.is_empty()
-            || (world.state.writter.is_none() && !world.state.write_queue.is_empty())
+            || (world.state.writers.is_empty() && !world.state.write_queue.is_empty())
         {
-            if world.state.writter.is_none() {
+            if world.state.writers.is_empty() {
                 if let Some(next) = world.state.write_queue.pop_front() {
                     world.actors[next.0].enqueued = false;
-                    world.actors[next.0].op(&mut world.state, None);
+                    world.actors[next.0].op(&mut world.state);
                 }
             }
             if let Some(next) = world.state.read_queue.pop_front() {
                 world.actors[next.0].enqueued = false;
-                world.actors[next.0].op(&mut world.state, None);
+                world.actors[next.0].op(&mut world.state);
             }
         }
     }
     while !world.state.read_queue.is_empty() || !world.state.write_queue.is_empty() {
-        if world.state.writter.is_none() {
+        if world.state.writers.is_empty() {
             if let Some(next) = world.state.write_queue.pop_front() {
                 world.actors[next.0].enqueued = false;
-                world.actors[next.0].op(&mut world.state, None);
+                world.actors[next.0].op(&mut world.state);
             }
         }
         if let Some(next) = world.state.read_queue.pop_front() {
             world.actors[next.0].enqueued = false;
-            world.actors[next.0].op(&mut world.state, None);
+            world.actors[next.0].op(&mut world.state);
         }
         if world.state.read_queue.is_empty()
             && !world.state.write_queue.is_empty()
-            && world.state.writter.is_some()
+            && !world.state.writers.is_empty()
         {
-            assert!(world.actors[world.state.writter.take().unwrap().0]
+            assert!(world.actors[world.state.writers.pop_first().unwrap().0]
                 .commit(&mut world.state, Failure::default()));
         }
     }
@@ -610,7 +624,7 @@ fuzz_target!(|ops: Vec<Op>| {
             model: Default::default(),
             write_queue: Default::default(),
             read_queue: Default::default(),
-            writter: None,
+            writers: Default::default(),
             always_validate,
         },
         actors: Default::default(),

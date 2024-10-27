@@ -1444,7 +1444,6 @@ impl Transaction {
         }
         drop(transactions);
         let allocator = Allocator::new_transaction(inner, true)?;
-        state.metapage.tx_id += 1;
         trace!("new_multi_write {}", state.metapage.tx_id);
         let nodes = new_dirty_cache(&inner.opts);
         let trees = HashMap::default();
@@ -1459,7 +1458,7 @@ impl Transaction {
             nodes_spilled_span: Default::default(),
             wal_write_batch: Default::default(),
             scratch_buffer: Default::default(),
-            tracked_transaction: Some(state.metapage.tx_id - 1),
+            tracked_transaction: Some(state.metapage.tx_id),
             exclusive_write_lock: None,
             multi_write_lock: Some(write_lock),
             multi_write_commit_lock: None,
@@ -2218,7 +2217,9 @@ impl Transaction {
         trace!("release_free_buffers agressive {agressive:?}");
         debug_assert!(self.is_write_tx());
 
-        let prev_tx_id = self.tx_id() - 1;
+        let Some(prev_tx_id) = self.tx_id().checked_sub(1) else {
+            return;
+        };
         // Drop of old Read/Checkpoint transactions is responsible for
         // tail cleanup, we only have to attempt it here if there aren't any.
         if self.inner.transactions.lock().is_empty() {
@@ -2322,6 +2323,7 @@ impl Transaction {
                 "MultiWrite Commit start {}",
                 self.state.get_mut().metapage.tx_id
             );
+            self.state.get_mut().metapage.tx_id += 1;
             self.multi_write_commit_lock = Some(self.inner.multi_writer_commit_lock.lock_arc());
             let mut latest_state = *self.inner.state.lock();
             latest_state.metapage.tx_id += 1;
@@ -2344,6 +2346,7 @@ impl Transaction {
             match tree_state {
                 TreeState::Available { value, dirty } if !self.is_multi_write_tx() => {
                     if mem::take(dirty) {
+                        dbg!(*value);
                         value.key_delta = 0;
                         trees_tree.insert(tree_name, value.as_bytes())?;
                     }
@@ -2355,17 +2358,29 @@ impl Transaction {
                                 .unwrap()
                                 .into_ref()
                         });
-                        let mut needs_update;
                         let mut merged = existing.unwrap_or(*value);
+                        if merged.id != value.id {
+                            return Err(Error::WriteConflict);
+                        }
+                        dbg!(existing, *value);
+                        let needs_update;
                         if existing.is_some() {
-                            if merged.id != value.id {
+                            if u64::try_from(value.key_delta).ok() != Some(value.num_keys)
+                                && merged.root == PageId::default()
+                            {
                                 return Err(Error::WriteConflict);
                             }
-                            needs_update = value.key_delta != 0;
-                            if self.nodes.borrow().peek(&{ value.root }).is_some() {
-                                needs_update = true;
-                                merged.root = value.root;
+                            needs_update = merged.root != value.root
+                                || merged.level != value.level
+                                || value.key_delta != 0;
+                            if needs_update
+                                && merged.root != PageId::default()
+                                && self.nodes.borrow().peek(&{ merged.root }).is_none()
+                            {
+                                return Err(Error::WriteConflict);
                             }
+                            merged.root = value.root;
+                            merged.level = value.level;
                             merged.num_keys = merged.num_keys.wrapping_add_signed(value.key_delta);
                         } else {
                             needs_update = true;
@@ -2456,13 +2471,13 @@ impl Transaction {
         if let Some(mut write_lock) = self.exclusive_write_lock.take() {
             // Release write lock and move the write state into it
             // TODO: consider limiting the size of some of these
-            write_lock.nodes = Some(mem::replace(self.nodes.get_mut(), void_dirty_cache()));
-            write_lock.trees = Some(mem::take(self.trees.get_mut()));
-            write_lock.scratch_buffer = mem::take(self.scratch_buffer.get_mut());
-            write_lock.wal_write_batch = self.wal_write_batch.get_mut().take().map(|mut wb| {
-                wb.clear();
-                wb
-            });
+            // write_lock.nodes = Some(mem::replace(self.nodes.get_mut(), void_dirty_cache()));
+            // write_lock.trees = Some(mem::take(self.trees.get_mut()));
+            // write_lock.scratch_buffer = mem::take(self.scratch_buffer.get_mut());
+            // write_lock.wal_write_batch = self.wal_write_batch.get_mut().take().map(|mut wb| {
+            //     wb.clear();
+            //     wb
+            // });
         } else {
             self.multi_write_lock = None;
             self.multi_write_commit_lock = None;
