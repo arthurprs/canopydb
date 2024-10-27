@@ -1,5 +1,5 @@
 use crate::{
-    cursor::{BaseIter, Cursor, RangeIter, RangeKeysIter},
+    cursor::{BaseIter, RangeIter, RangeKeysIter},
     error::{error_validation, Error},
     node::*,
     page::Page,
@@ -88,8 +88,10 @@ pub(crate) enum TreeState {
     Deleted,
 }
 
+#[derive(Debug)]
 enum MutateResult {
     Ok(PageId),
+    #[debug("Split(_0, _1, {})", EscapedBytes(_2))]
     Split(PageId, PageId, Vec<u8>),
     Underflow(PageId),
 }
@@ -115,21 +117,6 @@ impl Drop for Tree<'_> {
                 value: self.value,
                 dirty: self.dirty,
             };
-        }
-    }
-}
-
-impl std::fmt::Debug for MutateResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Ok(arg0) => f.debug_tuple("Ok").field(arg0).finish(),
-            Self::Split(arg0, arg1, arg2) => f
-                .debug_tuple("Split")
-                .field(arg0)
-                .field(arg1)
-                .field(&EscapedBytes(arg2))
-                .finish(),
-            Self::Underflow(arg0) => f.debug_tuple("Underflow").field(arg0).finish(),
         }
     }
 }
@@ -882,8 +869,9 @@ impl<'tx> Tree<'tx> {
     }
 
     /// Returns the Tree's Cursor
-    pub(crate) fn cursor(&self) -> Cursor<'tx, '_> {
-        Cursor::new(self)
+    #[cfg(test)]
+    pub(crate) fn cursor(&self) -> crate::cursor::Cursor<'tx, '_> {
+        crate::cursor::Cursor::new(self)
     }
 
     /// Returns an iterator over the key value pairs of the specified range.

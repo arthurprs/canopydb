@@ -534,6 +534,7 @@ impl std::fmt::Debug for EscapedBytes<'_> {
         Ok(())
     }
 }
+
 #[derive(Display)]
 #[display("{:?}", self)]
 /// Outputs bytes sizes as human sizes

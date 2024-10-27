@@ -90,7 +90,6 @@ type HashMap<K, V> = hash_map::HashMap<K, V, foldhash::fast::RandomState>;
 
 use env::EnvironmentHandle;
 use lock_api::{ArcMutexGuard, ArcRwLockReadGuard, ArcRwLockWriteGuard};
-use rand::Rng;
 use smallvec::SmallVec;
 use triomphe::Arc;
 use zerocopy::*;
@@ -188,7 +187,6 @@ pub struct Transaction {
 impl std::fmt::Debug for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Transaction")
-            // .field("inner", &0)
             .field("state", &self.state.get())
             .field("trees", &self.trees)
             .field("nodes", &self.nodes)
@@ -553,9 +551,9 @@ impl DatabaseRecovery {
                     let tree = Self::get_tree_by_id(&self.tx, &mut trees_by_id, tree_id)?;
                     tree.delete_range(bounds)?;
                 }
-                wb::Operation::CreateTree(name, options) => {
+                wb::Operation::CreateTree(tree_id, name, options) => {
                     trees_by_id.clear();
-                    self.tx.get_or_create_tree_with(&name, options)?;
+                    self.tx.create_tree(tree_id, &name, options)?;
                 }
                 wb::Operation::DeleteTree(name) => {
                     trees_by_id.clear();
@@ -1194,13 +1192,22 @@ impl WriteTransaction {
             options.validate_value(&tree.value).guard_trap(guard)?;
             return Ok(tree);
         }
+        self.create_tree(rand::random(), name, options)
+            .guard_trap(guard)
+    }
+
+    fn create_tree(
+        &self,
+        tree_id: TreeId,
+        name: &[u8],
+        options: TreeOptions,
+    ) -> Result<Tree<'_>, Error> {
         self.mark_dirty();
         if let Some(write_batch) = &mut *self.wal_write_batch.borrow_mut() {
-            write_batch.push_create_tree(name, &options.to_bytes())?;
+            write_batch.push_create_tree(&tree_id, name, &options)?;
         }
-        guard.disarm();
         let name: Arc<[u8]> = name.into();
-        let value = options.to_value(rand::thread_rng().gen());
+        let value = options.to_value(tree_id);
         self.trees
             .borrow_mut()
             .insert(name.clone(), TreeState::InUse { value });
@@ -2514,20 +2521,13 @@ impl Transaction {
         }
 
         let guard = self.trap.setup()?;
-        let trees = self.get_trees_tree();
-        let mut cursor = trees.cursor();
-        cursor.first()?;
-        while let Some((k, v)) = cursor.peek()? {
-            let value = *Ref::<_, TreeValue>::new_unaligned(v).unwrap().into_ref();
+        for result in self.get_trees_tree().iter()? {
+            let (k, v) = result?;
+            let value = *Ref::<_, TreeValue>::new_unaligned(v.as_ref())
+                .unwrap()
+                .into_ref();
             if value.id == id {
-                let k = k.to_owned();
-                drop(cursor);
-                drop(trees);
                 return self.get_tree_internal(&k).guard_trap(guard);
-            }
-
-            if !cursor.next()? {
-                break;
             }
         }
         guard.disarm();

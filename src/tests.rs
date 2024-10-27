@@ -684,10 +684,7 @@ fn delete_works() {
                 let deleted = tree.delete(k.as_bytes()).unwrap();
                 assert!(deleted);
             }
-
-            let mut cursor = tree.cursor();
-            assert!(!cursor.first().unwrap());
-            drop(cursor);
+            assert!(tree.keys().unwrap().next().is_none());
             assert_eq!(tree.len(), 0);
         } else if _round_no % 100 == 0 {
             for k in master_sample
@@ -724,9 +721,7 @@ fn delete_works() {
         let deleted = tree.delete(k.as_bytes()).unwrap();
         assert!(deleted);
     }
-    let mut cursor = tree.cursor();
-    assert!(!cursor.first().unwrap());
-    drop(cursor);
+    assert!(tree.keys().unwrap().next().is_none());
     assert_eq!(tree.len(), 0);
     drop(tree);
     tx.commit().unwrap();

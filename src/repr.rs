@@ -262,13 +262,10 @@ pub struct TreeValue {
 
 impl std::fmt::Debug for TreeValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let id = self.id;
-        let root = self.root;
-        let num_keys = self.num_keys;
         f.debug_struct("TreeValue")
-            .field("id", &id)
-            .field("root", &root)
-            .field("num_keys", &num_keys)
+            .field("id", &{ self.id })
+            .field("root", &{ self.root })
+            .field("num_keys", &{ self.num_keys })
             .field("nodes_compressed", &self.nodes_compressed)
             .field("overflow_compressed", &self.overflow_compressed)
             .field("min_branch_node_pages", &self.min_branch_node_pages)
