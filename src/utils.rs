@@ -511,7 +511,7 @@ impl<T> WaitJoinHandle<T> {
     }
 }
 
-#[derive(Display)]
+#[derive(Display, PartialEq, Eq)]
 #[display("{:?}", self)]
 /// Outputs bytes as escaped ascii strings
 pub struct EscapedBytes<'a>(pub &'a [u8]);

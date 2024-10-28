@@ -42,6 +42,7 @@ mod write_batch;
 
 use core::panic;
 use std::{
+    backtrace,
     borrow::Cow,
     cell::{Cell, RefCell},
     cmp::Ordering,
@@ -2307,9 +2308,14 @@ impl Transaction {
     }
 
     fn check_conflicts(&mut self) -> bool {
-        let tx_id = self.tx_id();
+        debug_assert!(self.is_multi_write_tx());
+        let base_tx_id = self.tracked_transaction.unwrap();
         for (&page_id, _) in self.nodes.get_mut().iter() {
-            if !self.inner.page_table.is_latest_page(tx_id, page_id) {
+            if !self
+                .inner
+                .page_table
+                .is_latest_from_lte(base_tx_id, page_id)
+            {
                 return true;
             }
         }
@@ -2330,8 +2336,6 @@ impl Transaction {
             if latest_state.metapage.tx_id == self.state.get_mut().metapage.tx_id {
                 self.multi_write_commit_lock = None;
                 self.flags.get_mut().remove(TF::MULTI_WRITE_TX);
-            } else if self.check_conflicts() {
-                return Err(Error::WriteConflict);
             } else {
                 self.state.get_mut().metapage = latest_state.metapage;
             }
@@ -2346,7 +2350,6 @@ impl Transaction {
             match tree_state {
                 TreeState::Available { value, dirty } if !self.is_multi_write_tx() => {
                     if mem::take(dirty) {
-                        dbg!(*value);
                         value.key_delta = 0;
                         trees_tree.insert(tree_name, value.as_bytes())?;
                     }
@@ -2362,11 +2365,10 @@ impl Transaction {
                         if merged.id != value.id {
                             return Err(Error::WriteConflict);
                         }
-                        dbg!(existing, *value);
                         let needs_update;
                         if existing.is_some() {
-                            if u64::try_from(value.key_delta).ok() != Some(value.num_keys)
-                                && merged.root == PageId::default()
+                            if u64::try_from(value.key_delta).ok() == Some(value.num_keys)
+                                && merged.root != PageId::default()
                             {
                                 return Err(Error::WriteConflict);
                             }
@@ -2401,6 +2403,12 @@ impl Transaction {
         drop(trees_tree);
         *self.trees.get_mut() = tx_trees;
         self.state.get_mut().metapage.trees_tree = trees_value;
+
+        if self.is_multi_write_tx() {
+            if self.check_conflicts() {
+                return Err(Error::WriteConflict);
+            }
+        }
 
         self.commit_dirty_nodes()?;
 

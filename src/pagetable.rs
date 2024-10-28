@@ -244,9 +244,9 @@ impl PageTable {
         self.peek(tx_id, page_id, |from, item| Some((from, item.to_item()?)))
     }
 
-    pub fn is_latest_page(&self, tx_id: TxId, page_id: PageId) -> bool {
+    pub fn is_latest_from_lte(&self, tx_id: TxId, page_id: PageId) -> bool {
         if let Some(values) = self.table.get(&page_id) {
-            values.last().map_or(true, |&(from, _)| from < tx_id)
+            values.last().map_or(true, |&(from, _)| from <= tx_id)
         } else {
             true
         }

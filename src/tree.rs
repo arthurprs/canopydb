@@ -1118,6 +1118,9 @@ fn node_split_right<TYPE: NodeRepr>(
             tree.allocate_node(right_size, Some(node.header().level))?,
         );
         right.as_dirty().set_key_prefix(&right_prefix);
+        if tree.tx.is_multi_write_tx() {
+            tree.tx.make_dirty(node)?;
+        }
         return Ok((false, full_separator, right));
     }
 

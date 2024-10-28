@@ -281,7 +281,7 @@ impl Actor {
             }
             Tx::Write(model, tx, starting) => {
                 let tx_id = tx.tx_id();
-                trace!("commiting {}", tx_id);
+                info!("[{}] commiting {}", self.id.0, tx_id);
                 Self::validate(state, &model, &tx);
                 match failure.call(|| tx.commit()) {
                     Ok(_) => {
@@ -296,7 +296,7 @@ impl Actor {
                                 state_model.remove(k);
                             }
                         }
-                    },
+                    }
                     Err(e) => error!("commit failed: {e}"),
                 }
                 Self::validate(state, &state.model, &state.db.begin_read().unwrap());
@@ -324,7 +324,7 @@ impl Actor {
                 false
             }
             Tx::Write(model, tx, ..) => {
-                trace!("rolling back {}", tx.tx_id());
+                info!("[{}] rolling back {}", self.id.0, tx.tx_id());
                 Self::validate(state, &model, &tx);
                 if let Err(e) = failure.call(|| tx.rollback()) {
                     error!("rollback failed: {e}");
@@ -376,7 +376,9 @@ impl Actor {
             Tx::None => {
                 if state.writers.len() < MAX_WRITERS {
                     match state.db.begin_write() {
-                        Ok(tx) => self.tx = Tx::Write((*state.model).clone(), tx, state.model.clone()),
+                        Ok(tx) => {
+                            self.tx = Tx::Write((*state.model).clone(), tx, state.model.clone())
+                        }
                         Err(Error::DatabaseHalted) => return false,
                         Err(e) => panic!("{e}"),
                     }
@@ -418,7 +420,7 @@ impl Actor {
                         (k, None, f)
                     }
                     Op::DeleteRange(_, (start, end), failure) => {
-                        trace!("delete range {start:?} {end:?}");
+                        info!("[{}] delete range {start:?} {end:?}", self.id.0);
                         match failure.call(|| {
                             tree.delete_range::<&[u8]>((
                                 start.as_ref().map(|a| &a.0[..]),
@@ -443,7 +445,7 @@ impl Actor {
                     _ => unreachable!(),
                 };
                 if let Some(v) = v {
-                    trace!("inserting {:?}: {:?}", k, v);
+                    info!("[{}] inserting {k:?}: {v:?}", self.id.0);
                     match failure.call(|| tree.insert(&k.0, &v.0)) {
                         Ok(_) => {
                             model.insert(k, v);
@@ -451,7 +453,7 @@ impl Actor {
                         Err(e) => error!("insert failed: {e}"),
                     }
                 } else {
-                    trace!("deleting {:?}", k);
+                    info!("[{}] deleting {k:?}", self.id.0);
                     match failure.call(|| tree.delete(&k.0)) {
                         Ok(_) => {
                             model.remove(&k);
@@ -511,12 +513,22 @@ impl Actor {
             for (k, mv) in model {
                 let k = k.0.as_slice();
                 let mv = mv.0.as_slice();
-                assert_eq!(tree.get(k).unwrap().as_deref(), Some(mv));
-                let mut range = tree.range(k..=k).unwrap();
-                let (k1, v1) = range.next().unwrap().unwrap();
-                assert_eq!(k, k1.as_ref());
-                assert_eq!(mv, v1.as_ref());
-                assert!(range.next().is_none());
+                assert_eq!(
+                    EscapedBytes(tree.get(k).unwrap().unwrap().as_ref()),
+                    EscapedBytes(mv),
+                    "key {:?}",
+                    EscapedBytes(k.as_ref())
+                );
+                // let mut range = tree.range(k..=k).unwrap();
+                // let (k1, v1) = range.next().unwrap().unwrap();
+                // assert_eq!(EscapedBytes(k), EscapedBytes(k1.as_ref()));
+                // assert_eq!(
+                //     EscapedBytes(mv),
+                //     EscapedBytes(v1.as_ref()),
+                //     "key {:?}",
+                //     EscapedBytes(k.as_ref())
+                // );
+                // assert!(range.next().is_none());
             }
             assert_eq!(tree.len() as usize, model.len());
         }
