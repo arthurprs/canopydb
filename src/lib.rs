@@ -2230,6 +2230,7 @@ impl Transaction {
         if !agressive {
             return;
         }
+        let mut to_free = SmallVec::<FreePage, 15>::new();
         let mut emptied = SmallVec::<TxId, 15>::new();
         let transactions = self.inner.transactions.lock();
         let mut buffers_free = self.inner.buffers_free.lock();
@@ -2253,12 +2254,10 @@ impl Transaction {
             if previous_tx_id + 1 >= releasing_tx_id {
                 continue;
             }
-            let early_free = utils::vec_drain_if(pending, |&FreePage(visible_from, _)| {
-                visible_from > previous_tx_id
-            });
-            for FreePage(from_tx_id, page_id) in early_free {
-                self.inner.page_table.remove_at(from_tx_id, page_id);
-            }
+            to_free.extend(utils::vec_drain_if(
+                pending,
+                |&FreePage(visible_from, _)| visible_from > previous_tx_id,
+            ));
             if pending.is_empty() {
                 emptied.push(releasing_tx_id);
             }
@@ -2266,6 +2265,10 @@ impl Transaction {
         drop(transactions);
         for releasing_tx_id in emptied {
             buffers_free.remove(&releasing_tx_id);
+        }
+        drop(buffers_free);
+        for FreePage(from_tx_id, page_id) in to_free {
+            self.inner.page_table.remove_at(from_tx_id, page_id);
         }
     }
 
@@ -2334,9 +2337,11 @@ impl Transaction {
             let mut latest_state = *self.inner.state.lock();
             latest_state.metapage.tx_id += 1;
             if latest_state.metapage.tx_id == self.state.get_mut().metapage.tx_id {
-                self.multi_write_commit_lock = None;
                 self.flags.get_mut().remove(TF::MULTI_WRITE_TX);
             } else {
+                if self.check_conflicts() {
+                    return Err(Error::WriteConflict);
+                }
                 self.state.get_mut().metapage = latest_state.metapage;
             }
         }
@@ -2372,15 +2377,15 @@ impl Transaction {
                             {
                                 return Err(Error::WriteConflict);
                             }
-                            needs_update = merged.root != value.root
-                                || merged.level != value.level
-                                || value.key_delta != 0;
-                            if needs_update
+                            if merged.root != value.root
                                 && merged.root != PageId::default()
                                 && self.nodes.borrow().peek(&{ merged.root }).is_none()
                             {
                                 return Err(Error::WriteConflict);
                             }
+                            needs_update = merged.root != value.root
+                                || merged.level != value.level
+                                || value.key_delta != 0;
                             merged.root = value.root;
                             merged.level = value.level;
                             merged.num_keys = merged.num_keys.wrapping_add_signed(value.key_delta);
@@ -2403,12 +2408,6 @@ impl Transaction {
         drop(trees_tree);
         *self.trees.get_mut() = tx_trees;
         self.state.get_mut().metapage.trees_tree = trees_value;
-
-        if self.is_multi_write_tx() {
-            if self.check_conflicts() {
-                return Err(Error::WriteConflict);
-            }
-        }
 
         self.commit_dirty_nodes()?;
 
