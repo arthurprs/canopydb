@@ -365,6 +365,12 @@ struct OpenTxn {
     ref_count: usize,
 }
 
+#[derive(Debug, Default)]
+struct FreeBuffers {
+    free: BTreeMap<TxId, Vec<FreePage>>,
+    scan_from: TxId,
+}
+
 struct DatabaseInner {
     /// An open transaction holds a handle to the environment.
     /// If a database is closed, no more _user_ transactions can be created,
@@ -383,7 +389,7 @@ struct DatabaseInner {
     /// Page Buffers freed by transactions.
     /// Can be released when they are no longer visible
     /// Map<transaction that freed, Vec<visible from tx (Inc.), buffer idx>>
-    buffers_free: Mutex<BTreeMap<TxId, Vec<FreePage>>>,
+    free_buffers: Mutex<FreeBuffers>,
     /// Map<checkpoint tx, Freelist>.
     /// Note: Freelists may be empty
     /// Doesn't contain the freelist for the latest snapshot (metapage.snapshot_tx_id) nor for
@@ -659,7 +665,7 @@ impl Database {
             multi_writer_commit_lock: Default::default(),
             old_snapshots: Default::default(),
             allocator: Default::default(),
-            buffers_free: Default::default(),
+            free_buffers: Default::default(),
             transactions: Default::default(),
             transactions_condvar: Default::default(),
             running_stats: Default::default(),
@@ -942,14 +948,10 @@ impl Database {
     /// This property is automatically enforced by the Database.
     /// The returned transaction must be committed for the changes to be persisted.
     pub fn begin_write(&self) -> Result<WriteTransaction, Error> {
+        let throttle_spans = self.inner.opts.throttle_memory_limit / PAGE_SIZE as usize;
         let mut tx = Transaction::new_multi_write(&self.inner, true)?;
-        tx.release_free_buffers(
-            tx.inner.page_table.spans_used()
-                >= self.inner.opts.throttle_memory_limit / PAGE_SIZE as usize,
-        );
-        if tx.inner.page_table.spans_used()
-            >= self.inner.opts.throttle_memory_limit / PAGE_SIZE as usize
-        {
+        tx.release_free_buffers(tx.inner.page_table.spans_used() >= throttle_spans);
+        if tx.inner.page_table.spans_used() >= throttle_spans {
             // drop tx to avoid deadlocking with checkpoints
             drop(tx);
             info!("Throttling write tx");
@@ -1314,34 +1316,37 @@ impl Drop for Transaction {
             let _ = self.do_rollback();
         }
         if let Some(tx_id) = self.tracked_transaction {
-            let earliest_open_read_tx;
-            let earliest_tx_needed;
-            {
-                let mut transactions = self.inner.transactions.lock();
-                let idx = transactions
-                    .binary_search_by_key(&tx_id, |ot| ot.tx_id)
-                    .expect("missing transaction");
-                let ot = &mut transactions[idx];
-                ot.ref_count -= 1;
-                if ot.ref_count == 0 {
-                    transactions.remove(idx);
-                }
-                earliest_open_read_tx = transactions.first().map(|ot| ot.tx_id);
-                earliest_tx_needed = earliest_open_read_tx.or_else(|| {
-                    // The state read must be done while holding the transactions lock
-                    // to avoid a new read transaction from being created at the same tx-id as this (X) .
-                    // While this drop will drop the transactions lock and reads a _newly_ committed
-                    // tx-id from state (X+1), then proceed to remove the buffers needed by X.
-                    self.inner
-                        .state
-                        .try_lock()
-                        .map(|state| state.metapage.tx_id)
-                });
+            let mut transactions = self.inner.transactions.lock();
+            let idx = transactions
+                .binary_search_by_key(&tx_id, |ot| ot.tx_id)
+                .expect("missing transaction");
+            let ot = &mut transactions[idx];
+            ot.ref_count -= 1;
+            let removed_tx = ot.ref_count == 0;
+            if removed_tx {
+                transactions.remove(idx);
             }
+            let earliest_open_read_tx = transactions.first().map(|ot| ot.tx_id);
+            let earliest_tx_needed = earliest_open_read_tx.or_else(|| {
+                // The state read must be done while holding the transactions lock
+                // to avoid a new read transaction from being created at the same tx-id as this (X) .
+                // While this drop will drop the transactions lock and reads a _newly_ committed
+                // tx-id from state (X+1), then proceed to remove the buffers needed by X.
+                self.inner
+                    .state
+                    .try_lock()
+                    .map(|state| state.metapage.tx_id)
+            });
+            drop(transactions);
+
             match earliest_tx_needed {
                 Some(earliest) if earliest > tx_id => {
                     trace!("Calling release_free_buffers_tail from read tx {tx_id} drop, earliest tx needed {earliest}");
                     self.release_free_buffers_tail(earliest, false);
+                }
+                _ if removed_tx => {
+                    let mut free_buffers = self.inner.free_buffers.lock();
+                    free_buffers.scan_from = free_buffers.scan_from.min(tx_id);
                 }
                 _ => (),
             }
@@ -1349,6 +1354,7 @@ impl Drop for Transaction {
                 self.inner.transactions_condvar.notify_all();
             }
         }
+
         // This txn might be the last strong database reference and thus last env reference
         let _maybe_last_env = self.env_handle.take().and_then(|env_handle| {
             // 1 ref here and 1 ref in the bg thread
@@ -2188,14 +2194,14 @@ impl Transaction {
         trace!("release_free_buffers_tail earliest_tx {earliest_tx} can_block {can_block:?}");
         let mut released = SmallVec::<_, 3>::new();
         {
-            let mut buffers_free = if can_block {
-                self.inner.buffers_free.lock()
-            } else if let Some(guard) = self.inner.buffers_free.try_lock() {
+            let mut free_buffers = if can_block {
+                self.inner.free_buffers.lock()
+            } else if let Some(guard) = self.inner.free_buffers.try_lock() {
                 guard
             } else {
                 return;
             };
-            while let Some(pending) = buffers_free.first_entry() {
+            while let Some(pending) = free_buffers.free.first_entry() {
                 if *pending.key() <= earliest_tx {
                     released.push((*pending.key(), pending.remove()));
                 } else {
@@ -2218,32 +2224,34 @@ impl Transaction {
         trace!("release_free_buffers agressive {agressive:?}");
         debug_assert!(self.is_write_tx());
 
-        let Some(prev_tx_id) = self.tx_id().checked_sub(1) else {
-            return;
-        };
+        let earliest_tx_needed = self.tracked_transaction.unwrap_or_else(|| self.tx_id() - 1);
         // Drop of old Read/Checkpoint transactions is responsible for
         // tail cleanup, we only have to attempt it here if there aren't any.
-        if self.inner.transactions.lock().is_empty() {
-            self.release_free_buffers_tail(prev_tx_id, agressive);
+        if self.tracked_transaction.is_none() {
+            self.release_free_buffers_tail(earliest_tx_needed, agressive);
         }
 
         if !agressive {
             return;
         }
         let mut to_free = SmallVec::<FreePage, 15>::new();
-        let mut emptied = SmallVec::<TxId, 15>::new();
-        let transactions = self.inner.transactions.lock();
-        let mut buffers_free = self.inner.buffers_free.lock();
-        let mut transactions_iter = transactions.iter().map(|ot| ot.tx_id).peekable();
+        let mut emptied = SmallVec::<TxId, 8>::new();
+        let mut transactions = SmallVec::<TxId, 8>::from_iter(
+            self.inner.transactions.lock().iter().map(|ot| ot.tx_id),
+        )
+        .into_iter()
+        .peekable();
+        let mut locked_free_buffers = self.inner.free_buffers.lock();
         let mut previous_tx_id = 0;
-        for (&releasing_tx_id, pending) in buffers_free.iter_mut() {
-            if releasing_tx_id >= prev_tx_id {
+        let free_buffers = &mut *locked_free_buffers;
+        for (&releasing_tx_id, pending) in free_buffers.free.range_mut(free_buffers.scan_from..) {
+            if releasing_tx_id >= earliest_tx_needed {
                 break;
             }
-            while let Some(&t) = transactions_iter.peek() {
+            while let Some(&t) = transactions.peek() {
                 if t <= releasing_tx_id {
                     previous_tx_id = t;
-                    transactions_iter.next();
+                    transactions.next();
                 } else {
                     break;
                 }
@@ -2262,11 +2270,11 @@ impl Transaction {
                 emptied.push(releasing_tx_id);
             }
         }
-        drop(transactions);
         for releasing_tx_id in emptied {
-            buffers_free.remove(&releasing_tx_id);
+            free_buffers.free.remove(&releasing_tx_id);
         }
-        drop(buffers_free);
+        free_buffers.scan_from = earliest_tx_needed + 1;
+        drop(locked_free_buffers);
         for FreePage(from_tx_id, page_id) in to_free {
             self.inner.page_table.remove_at(from_tx_id, page_id);
         }
@@ -2456,8 +2464,8 @@ impl Transaction {
                 self.inner.halt();
                 return Err(e);
             }
-            let mut buffers_free = self.inner.buffers_free.lock();
-            match buffers_free.entry(self.state.get_mut().metapage.tx_id) {
+            let mut free_buffers = self.inner.free_buffers.lock();
+            match free_buffers.free.entry(self.state.get_mut().metapage.tx_id) {
                 btree_map::Entry::Vacant(v) => {
                     v.insert(mem::take(&mut allocator.buffer_free));
                 }
@@ -3354,8 +3362,9 @@ impl DatabaseInner {
             // Redirected buffer pages must be freed at the _next_ tx as this tx
             // may already have read transactions w/o the new indirection map.
             inner
-                .buffers_free
+                .free_buffers
                 .lock()
+                .free
                 .insert(state.metapage.tx_id + 1, checkpoint.redirected_buffers);
             state.metapage.page_header.id = new_metapage.page_header.id;
             state.metapage.snapshot_tx_id = snapshot_tx_id;
