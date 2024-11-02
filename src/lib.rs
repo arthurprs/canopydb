@@ -42,7 +42,6 @@ mod write_batch;
 
 use core::panic;
 use std::{
-    backtrace,
     borrow::Cow,
     cell::{Cell, RefCell},
     cmp::Ordering,
@@ -95,7 +94,7 @@ use smallvec::SmallVec;
 use triomphe::Arc;
 use zerocopy::*;
 
-pub(crate) const PAGE_SIZE: u64 = 4 * 1024;
+pub(crate) const PAGE_SIZE: u64 = 4 * 1024 - 8;
 #[cfg(not(fuzzing))]
 pub(crate) const MIN_PAGE_COMPRESSION_BYTES: u64 = 2 * PAGE_SIZE;
 #[cfg(fuzzing)]
@@ -771,7 +770,8 @@ impl Database {
             spans.merge(&freelist_spans).unwrap();
         }
 
-        let main_allocator = self.inner.allocator.lock();
+        let mut main_allocator = self.inner.allocator.lock();
+        main_allocator.merge_unmerged_free();
         spans.merge(&main_allocator.free).unwrap();
         let (snapshots_free_left, snapshots_free_right) = main_allocator
             .snapshot_free
@@ -1272,7 +1272,8 @@ impl WriteTransaction {
         let mut free_space;
         {
             // note that this only usable free space (e.g. not freespace from snapshots)
-            let main_allocator = self.0.inner.allocator.lock();
+            let mut main_allocator = self.0.inner.allocator.lock();
+            main_allocator.merge_unmerged_free();
             end_of_file = main_allocator.next_page_id;
             free_space = main_allocator.free.clone();
             free_space.merge(&self.0.allocator.get_mut().free)?;
@@ -2764,7 +2765,7 @@ impl DatabaseInner {
             page.raw_data.len(),
             page.span() as usize * PAGE_SIZE as usize
         );
-        let offset = at as u64 * PAGE_SIZE;
+        let offset = at as u64 * (4 * 1024);
         self.file.file.write_all_at(&page.raw_data, offset)?;
         Ok(())
     }
@@ -2803,7 +2804,7 @@ impl DatabaseInner {
                 let mut bytes = UninitBytes::new(initial_span as usize * PAGE_SIZE as usize);
                 self.file
                     .file
-                    .read_exact_at(mem::transmute(bytes.as_slice_mut()), at as u64 * PAGE_SIZE)
+                    .read_exact_at(mem::transmute(bytes.as_slice_mut()), at as u64 * (4*1024))
                     .unwrap();
                 bytes.assume_init()
             };

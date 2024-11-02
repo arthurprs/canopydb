@@ -19,6 +19,7 @@ use zerocopy::AsBytes;
 pub(crate) struct MainAllocator {
     /// Free Page Ids
     pub free: Freelist,
+    pub unmerged_free: Vec<Freelist>,
     /// Free Indirection Page Ids
     pub indirection_free: Freelist,
     /// Page Ids freed from the current snapshot (metapage.snapshot_tx_id)
@@ -60,6 +61,14 @@ pub(crate) struct Allocator {
 }
 
 impl MainAllocator {
+    pub fn merge_unmerged_free(&mut self) {
+        let mut free = mem::take(&mut self.free);
+        for f in self.unmerged_free.drain(..) {
+            free.merge(&f).unwrap();
+        }
+        self.free = free;
+    }
+
     pub fn truncate_end(&mut self) {
         let mut returned = 0;
         while let Some((page, span)) = self.free.last_piece() {
@@ -113,6 +122,7 @@ impl MainAllocator {
         + size_of::<PageId>() // next_indirection_id
         + size_of::<u8>() // num freelists
         + self.free.serialized_size()
+        + self.unmerged_free.iter().map(Freelist::serialized_size).sum::<usize>()
         + self.indirection_free.serialized_size()
         + self.snapshot_free.serialized_size()
         + self.next_snapshot_free.serialized_size()
@@ -133,8 +143,13 @@ impl Allocator {
         result.main_next_page_id = main.next_page_id;
         result.main_next_indirection_id = main.next_indirection_id;
         if multi {
-            result.free = main.free.bulk_allocate(Self::MULTI_W_INITIAL_ALLOC, true);
+            if let Some(some) = main.unmerged_free.pop() {
+                result.free = some;
+            } else {
+                result.free = main.free.bulk_allocate(Self::MULTI_W_INITIAL_ALLOC, true);
+            }
         } else {
+            main.merge_unmerged_free();
             let is_checkpointing = inner.checkpoint_lock.is_locked();
             if is_checkpointing {
                 let bulk_span = (main.free.len() / 2)
@@ -154,13 +169,14 @@ impl Allocator {
             main: Some(inner.allocator.clone()),
             ..Default::default()
         };
-        let main = inner.allocator.lock();
+        let mut main = inner.allocator.lock();
         result.main_next_page_id = main.next_page_id;
         result.main_next_indirection_id = main.next_indirection_id;
         result.indirection_free = main.indirection_free.clone();
         // Whatever is left in free goes into externally_allocated and we won't be able to use
         // it anymore. If reserve_from_global_state is required later it'll have to remove
         // from externally_allocated to make sure pages aren't duplicated.
+        main.merge_unmerged_free();
         result.externally_allocated.merge(&main.free)?;
         result.externally_allocated.merge(&main.snapshot_free)?;
         // next_snapshot_free can only grow while a checkpointer is running
@@ -183,6 +199,7 @@ impl Allocator {
             );
         }
         let mut main = self.main.as_ref().unwrap().lock();
+        main.merge_unmerged_free();
 
         if self.is_checkpointer {
             match self.main_next_page_id.cmp(&main.next_page_id) {
@@ -300,7 +317,7 @@ impl Allocator {
 
     pub fn commit(&mut self) -> Result<(), Error> {
         let mut main = self.main.as_ref().unwrap().lock();
-        main.free.merge(&self.free)?;
+        main.unmerged_free.push(mem::take(&mut self.free));
         // indirection_free from the ckp allocator is a copy
         // of main allocator indirection_free when it was created.
         if !self.is_checkpointer {
