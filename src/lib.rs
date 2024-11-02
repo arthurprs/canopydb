@@ -94,7 +94,7 @@ use smallvec::SmallVec;
 use triomphe::Arc;
 use zerocopy::*;
 
-pub(crate) const PAGE_SIZE: u64 = 4 * 1024 - 8;
+pub(crate) const PAGE_SIZE: u64 = 4 * 1024;
 #[cfg(not(fuzzing))]
 pub(crate) const MIN_PAGE_COMPRESSION_BYTES: u64 = 2 * PAGE_SIZE;
 #[cfg(fuzzing)]
@@ -771,10 +771,11 @@ impl Database {
         }
 
         let mut main_allocator = self.inner.allocator.lock();
-        main_allocator.merge_unmerged_free();
-        spans.merge(&main_allocator.free).unwrap();
+        spans.merge(main_allocator.free.merged().unwrap()).unwrap();
         let (snapshots_free_left, snapshots_free_right) = main_allocator
             .snapshot_free
+            .merged()
+            .unwrap()
             .clone()
             .split(FIRST_COMPRESSED_PAGE);
         spans.merge(&snapshots_free_left).unwrap();
@@ -789,7 +790,7 @@ impl Database {
         assert_eq!(last.0 + last.1 - 2, spans.len(), "{diff:?}");
 
         indirections
-            .merge(&main_allocator.indirection_free)
+            .merge(main_allocator.indirection_free.merged().unwrap())
             .unwrap();
         let last = indirections
             .last_piece()
@@ -1273,9 +1274,8 @@ impl WriteTransaction {
         {
             // note that this only usable free space (e.g. not freespace from snapshots)
             let mut main_allocator = self.0.inner.allocator.lock();
-            main_allocator.merge_unmerged_free();
             end_of_file = main_allocator.next_page_id;
-            free_space = main_allocator.free.clone();
+            free_space = main_allocator.free.merged()?.clone();
             free_space.merge(&self.0.allocator.get_mut().free)?;
         }
         // figure out the amount of data that is moveable using binary search
@@ -2765,7 +2765,7 @@ impl DatabaseInner {
             page.raw_data.len(),
             page.span() as usize * PAGE_SIZE as usize
         );
-        let offset = at as u64 * (4 * 1024);
+        let offset = at as u64 * PAGE_SIZE;
         self.file.file.write_all_at(&page.raw_data, offset)?;
         Ok(())
     }
@@ -2804,7 +2804,7 @@ impl DatabaseInner {
                 let mut bytes = UninitBytes::new(initial_span as usize * PAGE_SIZE as usize);
                 self.file
                     .file
-                    .read_exact_at(mem::transmute(bytes.as_slice_mut()), at as u64 * (4*1024))
+                    .read_exact_at(mem::transmute(bytes.as_slice_mut()), at as u64 * PAGE_SIZE)
                     .unwrap();
                 bytes.assume_init()
             };
@@ -3010,8 +3010,8 @@ impl DatabaseInner {
                     snapshot_id,
                 );
                 let mut allocator = self.allocator.lock();
-                allocator.free.merge(&left)?;
-                allocator.indirection_free.merge(&right)?;
+                allocator.free.merged()?.merge(&left)?;
+                allocator.indirection_free.merged()?.merge(&right)?;
             } else {
                 break;
             }
@@ -3390,7 +3390,7 @@ impl DatabaseInner {
             inner
                 .old_snapshots
                 .lock()
-                .insert(snapshot_tx_id, snapshot_free);
+                .insert(snapshot_tx_id, snapshot_free.into_merged().expect("TODO"));
             // which in turn might release old snapshots
             if let Err(e) = inner.release_old_snapshots(snapshot_tx_id) {
                 error!("Error releasing snapshot freelist: {e}");
@@ -3400,7 +3400,7 @@ impl DatabaseInner {
 
             // The checkpoint allocator is committed, older snapshts are released (if possible),
             // and we're holding the write lock. So it's a good opportunity to truncate the freelists.
-            inner.allocator.lock().truncate_end();
+            inner.allocator.lock().truncate_end().expect("TODO");
         }
         // We are not tracking the file size of all snapshots in use, so we could pick the max.
         // So it's only really safe if the earliest tx is using the latest snapshot.
