@@ -166,52 +166,45 @@ impl PageTable {
         trace!("replace at tx_id {tx_id} page {page_id}");
         let item = InnerItem::from(item);
         let item_pages = item.pages() as isize;
-        if let dashmap::mapref::entry::Entry::Occupied(mut o) = self.table.entry(page_id) {
-            let (last, rest) = o.get_mut().split_last_mut().unwrap();
-            let (target_item, latest) = if last.0 == tx_id {
-                (&mut last.1, true)
-            } else {
-                match rest.binary_search_by(|(i, _)| i.cmp(&tx_id)) {
-                    Ok(i) => (&mut rest[i].1, false),
-                    Err(_) => return None,
-                }
-            };
-            let replaced = mem::replace(target_item, item);
-            drop(o);
-            let page_delta = item_pages - replaced.pages() as isize;
-            self.spans_used.fetch_add(page_delta, Ordering::Relaxed);
-            Some((replaced.into_item()?, latest))
-        } else {
-            None
-        }
+        let dashmap::mapref::entry::Entry::Occupied(mut o) = self.table.entry(page_id) else {
+            return None;
+        };
+        let values = o.get_mut();
+        let (latest, replaced) = match values.binary_search_by(|(i, _)| i.cmp(&tx_id)) {
+            Ok(i) => (i + 1 == values.len(), mem::replace(&mut values[i].1, item)),
+            Err(_) => return None,
+        };
+        drop(o);
+        let page_delta = item_pages - replaced.pages() as isize;
+        self.spans_used.fetch_add(page_delta, Ordering::Relaxed);
+        Some((replaced.into_item()?, latest))
     }
 
     pub fn remove_at(&self, tx_id: TxId, page_id: PageId) -> Option<Item> {
         trace!("remove_at tx_id {tx_id} page {page_id}");
+        let dashmap::mapref::entry::Entry::Occupied(mut o) = self.table.entry(page_id) else {
+            return None;
+        };
         let _removed_vec; // make sure removed vecs are dropped outside the lock
-        if let dashmap::mapref::entry::Entry::Occupied(mut o) = self.table.entry(page_id) {
-            let values = o.get_mut();
-            match values.binary_search_by(|(i, _)| i.cmp(&tx_id)) {
-                Ok(i) => {
-                    let (_, item) = &mut values[i];
-                    let removed = mem::replace(item, InnerItem::None);
-                    if i == 0 {
-                        let nones = 1 + values[1..].iter().take_while(|(_, i)| i.is_none()).count();
-                        if nones < values.len() {
-                            values.drain(..nones);
-                        } else {
-                            _removed_vec = o.remove();
-                        }
-                    }
-                    self.spans_used
-                        .fetch_sub(removed.pages() as isize, Ordering::Relaxed);
-                    removed.into_item()
-                }
-                Err(_) => None,
+        let values = o.get_mut();
+        let Ok(i) = values.binary_search_by(|(i, _)| i.cmp(&tx_id)) else {
+            return None;
+        };
+        let removed = mem::replace(&mut values[i].1, InnerItem::None);
+        if i == 0 {
+            let nones = 1 + values[1..].iter().take_while(|(_, i)| i.is_none()).count();
+            if nones < values.len() {
+                values.drain(..nones);
+                drop(o);
+            } else {
+                _removed_vec = o.remove();
             }
         } else {
-            None
+            drop(o);
         }
+        self.spans_used
+            .fetch_sub(removed.pages() as isize, Ordering::Relaxed);
+        removed.into_item()
     }
 
     #[inline]
