@@ -9,7 +9,7 @@ use crate::{
     freelist::Freelist,
     repr::{PageId, FIRST_COMPRESSED_PAGE},
     shim::parking_lot::Mutex,
-    DatabaseInner, DeferredFreelist, FreePage, PAGE_SIZE,
+    DatabaseInner, DeferredFreelist, FreePage,
 };
 
 use triomphe::Arc;
@@ -124,8 +124,8 @@ impl MainAllocator {
 }
 
 impl Allocator {
-    const MULTI_W_INITIAL_ALLOC_MIN: PageId = 5;
-    const MULTI_W_INITIAL_ALLOC: PageId = 15;
+    const INITIAL_ALLOC_MIN: PageId = 10;
+    const INITIAL_ALLOC: PageId = 100;
     const ALLOCATION_BATCH: PageId = 100;
 
     pub fn new_transaction(inner: &DatabaseInner, multi: bool) -> Result<Allocator, Error> {
@@ -137,24 +137,9 @@ impl Allocator {
         let mut main = inner.allocator.lock();
         result.main_next_page_id = main.next_page_id;
         result.main_next_indirection_id = main.next_indirection_id;
-        if multi {
-            result.free = main.free.bulk_allocate(
-                Self::MULTI_W_INITIAL_ALLOC_MIN,
-                Self::MULTI_W_INITIAL_ALLOC,
-                true,
-            )?;
-        } else {
-            // let is_checkpointing = inner.checkpoint_lock.is_locked();
-            // if is_checkpointing {
-                result.free = main.free.bulk_allocate(
-                    Self::MULTI_W_INITIAL_ALLOC_MIN,
-                    Self::MULTI_W_INITIAL_ALLOC,
-                    true,
-                )?;
-            // } else {
-            //     mem::swap(&mut result.free, main.free.merged()?);
-            // }
-        }
+        result.free =
+            main.free
+                .bulk_allocate(Self::INITIAL_ALLOC_MIN, Self::INITIAL_ALLOC, true)?;
         drop(main);
         result.all_allocations.merge(&result.free)?;
         Ok(result)
@@ -315,16 +300,19 @@ impl Allocator {
     pub fn commit(&mut self) -> Result<(), Error> {
         let mut main = self.main.as_ref().unwrap().lock();
         main.free.append(mem::take(&mut self.free))?;
-        // indirection_free from the ckp allocator is a copy
-        // of main allocator indirection_free when it was created.
-        if !self.is_checkpointer {
-            main.indirection_free
-                .append(mem::take(&mut self.indirection_free))?;
-        }
         main.snapshot_free
             .append(mem::take(&mut self.snapshot_free))?;
         main.next_snapshot_free
             .append(mem::take(&mut self.next_snapshot_free))?;
+        if !self.is_checkpointer {
+            // indirection_free from the ckp allocator is a copy
+            // of main allocator indirection_free when it was created.
+            main.indirection_free
+                .append(mem::take(&mut self.indirection_free))?;
+        } else {
+            // force free to be merged, as we could be returning a large number of pages
+            main.free.merged()?;
+        }
         Ok(())
     }
 

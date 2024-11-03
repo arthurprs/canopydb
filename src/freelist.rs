@@ -55,10 +55,11 @@ impl DeferredFreelist {
     }
 
     pub fn append(&mut self, other: Freelist) -> Result<(), Error> {
-        if !other.is_empty() {
-            self.deferred.push(other);
-        }
-        Ok(())
+        // if !other.is_empty() {
+        //     self.deferred.push(other);
+        // }
+        // Ok(())
+        self.freelist.merge(&other)
     }
 
     pub fn into_merged(mut self) -> Result<Freelist, Error> {
@@ -85,6 +86,7 @@ impl DeferredFreelist {
         self.freelist.is_empty() && self.deferred.is_empty()
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> PageId {
         self.freelist.len() + self.deferred.iter().map(Freelist::len).sum::<PageId>()
     }

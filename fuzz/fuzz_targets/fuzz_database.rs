@@ -219,7 +219,7 @@ type ModelTreeMut = BTreeMap<Bytes, Bytes>;
 type ModelTree = Rc<ModelTreeMut>;
 type ModelTreeRef<'a> = &'a ModelTreeMut;
 const NUM_ACTORS: usize = 2;
-const MAX_WRITERS: usize = 2;
+const MAX_WRITERS: usize = 1;
 
 struct WorldState {
     writers: BTreeSet<ActorId>,
