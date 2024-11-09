@@ -903,11 +903,8 @@ impl Freelist {
         if span == 0 || span > MAX_ALLOCATION_SPAN || self.shards.is_none() {
             return None;
         }
-        let len_before = if cfg!(debug_assertions) {
-            self.len()
-        } else {
-            0
-        };
+        #[cfg(debug_assertions)]
+        let len_before = self.len();
         let shards = Arc::make_mut(self.shards.get_or_insert_with(Default::default));
         let mut result = None;
         if span <= SHARD_MAX_LEN {
@@ -938,18 +935,18 @@ impl Freelist {
     }
 
     pub fn remove(&mut self, mut page_id: PageId, mut span: PageId) -> PageId {
-        let len_before = if cfg!(debug_assertions) {
-            self.len()
-        } else {
-            0
+        #[cfg(debug_assertions)]
+        let len_before = self.len();
+        let Some(shards) = self.shards.as_mut() else {
+            return 0;
         };
         let mut removed = 0;
-        let shards = Arc::make_mut(self.shards.get_or_insert_with(Default::default));
         while span != 0 {
             let base = page_id / SHARD_MAX_LEN * SHARD_MAX_LEN;
             let base_end = base + SHARD_MAX_LEN;
             let span_for_shard = span.min(base_end - page_id);
             if let Ok(shard_pos) = shards.binary_search_by_key(&base, |s| s.base) {
+                let shards = Arc::make_mut(shards);
                 let shard = &mut shards[shard_pos];
                 removed += shard.remove(page_id, span_for_shard);
                 if shard.is_empty() {
