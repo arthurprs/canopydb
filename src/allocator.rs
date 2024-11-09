@@ -174,6 +174,7 @@ impl Allocator {
     }
 
     pub fn reserve_from_main(&mut self, mut span: PageId, bulk: bool) -> Result<(), Error> {
+        trace!("reserve_from_main span {span} bulk {bulk:?}");
         self.main_bulk_reservations += bulk as u64;
         if bulk {
             span = span.max(

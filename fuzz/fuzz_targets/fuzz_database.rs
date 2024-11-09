@@ -219,7 +219,7 @@ type ModelTreeMut = BTreeMap<Bytes, Bytes>;
 type ModelTree = Rc<ModelTreeMut>;
 type ModelTreeRef<'a> = &'a ModelTreeMut;
 const NUM_ACTORS: usize = 2;
-const MAX_WRITERS: usize = 1;
+const MAX_WRITERS: usize = 2;
 
 struct WorldState {
     writers: BTreeSet<ActorId>,
@@ -346,7 +346,9 @@ impl Actor {
             }
             Self::validate(state, &state.model, &state.db.begin_read().unwrap());
             match state.db.validate_free_space() {
-                Ok(()) | Err(Error::DatabaseHalted) => (),
+                Ok(()) => (),
+                #[cfg(feature = "failpoints")]
+                Err(Error::DatabaseHalted) => (),
                 Err(e) => panic!("{e}"),
             }
             if !self.op_queue.is_empty() {
@@ -379,6 +381,7 @@ impl Actor {
                         Ok(tx) => {
                             self.tx = Tx::Write((*state.model).clone(), tx, state.model.clone())
                         }
+                        #[cfg(feature = "failpoints")]
                         Err(Error::DatabaseHalted) => return false,
                         Err(e) => panic!("{e}"),
                     }
@@ -480,6 +483,7 @@ impl Actor {
         }
         match state.db.begin_read() {
             Ok(rx) => self.tx = Tx::Read(state.model.clone(), rx),
+            #[cfg(feature = "failpoints")]
             Err(Error::DatabaseHalted) => (),
             Err(e) => panic!("{e}"),
         }

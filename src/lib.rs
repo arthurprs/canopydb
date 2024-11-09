@@ -360,7 +360,8 @@ struct RunningStats {
 struct OpenTxn {
     tx_id: TxId,
     earliest_snapshot_tx_id: TxId,
-    ref_count: usize,
+    ref_count: u32,
+    writers: u32,
 }
 
 #[derive(Debug, Default)]
@@ -397,7 +398,8 @@ struct DatabaseInner {
     running_stats: Mutex<RunningStats>,
     commit_lock: StdArc<Mutex<CachedWriteState>>,
 
-    write_lock: StdArc<RwLock<()>>,    /// Open transactions other than the unique write transaction
+    write_lock: StdArc<RwLock<()>>,
+    /// Open transactions other than the unique write transaction
     /// This is a sorted Vec to avoid hitting the allocator when the collections len fluctuates (0-1-0-1..)
     /// Furthermore, min lookup are push-last are common, which more than make up for small linear removals.
     transactions: Mutex<Vec<OpenTxn>>,
@@ -1321,6 +1323,9 @@ impl Drop for Transaction {
                 .binary_search_by_key(&tx_id, |ot| ot.tx_id)
                 .expect("missing transaction");
             let ot = &mut transactions[idx];
+            if self.is_multi_write_tx() {
+                ot.writers -= 1;
+            }
             ot.ref_count -= 1;
             let removed_tx = ot.ref_count == 0;
             if removed_tx {
@@ -1440,11 +1445,15 @@ impl Transaction {
             drop(transactions);
         }
         match transactions.last_mut() {
-            Some(l) if l.tx_id == state.metapage.tx_id => l.ref_count += 1,
+            Some(l) if l.tx_id == state.metapage.tx_id => {
+                l.ref_count += 1;
+                l.writers += 1;
+            }
             _ => {
                 transactions.push(OpenTxn {
                     tx_id: state.metapage.tx_id,
                     ref_count: 1,
+                    writers: 1,
                     earliest_snapshot_tx_id: state.metapage.snapshot_tx_id,
                 });
             }
@@ -1496,6 +1505,7 @@ impl Transaction {
                 transactions.push(OpenTxn {
                     tx_id: state.metapage.tx_id,
                     ref_count: 1,
+                    writers: 0,
                     earliest_snapshot_tx_id: state.metapage.snapshot_tx_id,
                 });
             }
@@ -1867,7 +1877,7 @@ impl Transaction {
         )
     }
 
-    fn free_clean_page_buffer_and_snapshot(
+    fn free_snapshot_page(
         &self,
         allocator: &mut Allocator,
         page_id: PageId,
@@ -1963,12 +1973,11 @@ impl Transaction {
                 },
             );
             self.spill_dirty_nodes(spilled)?;
-            let new_id = self.allocate_page_id(
+            node_mut.node_header_mut().page_header.id = self.allocate_page_id(
                 &mut self.allocator.borrow_mut(),
                 node_mut.span(),
                 node_mut.id().is_compressed(),
             )?;
-            node_mut.node_header_mut().page_header.id = new_id;
         }
 
         let spilled = self
@@ -1977,6 +1986,15 @@ impl Transaction {
             .insert_with_lifecycle(node_mut.id(), TxNode::Popped(node_mut.page_size() as u64));
         self.spill_dirty_nodes(spilled)?;
         Ok(node_mut)
+    }
+
+    fn any_writers_before(&self) -> bool {
+        self.inner
+            .transactions
+            .lock()
+            .iter()
+            .take_while(|o| o.tx_id < self.tx_id())
+            .any(|o| o.writers > (Some(o.tx_id) == self.tracked_transaction) as u32)
     }
 
     #[cold]
@@ -2170,7 +2188,7 @@ impl Transaction {
                 } => {
                     trace!("commit_dirty_nodes freed {page_id}");
                     if from_snapshot {
-                        self.free_clean_page_buffer_and_snapshot(
+                        self.free_snapshot_page(
                             allocator,
                             page_id,
                             span,
@@ -2466,7 +2484,18 @@ impl Transaction {
         // Any failures after setting DONE are fatal
         self.flags.get_mut().insert(TF::DONE);
         {
+            let move_new_freed = self.tracked_transaction.is_some() && self.any_writers_before();
             let allocator = self.allocator.get_mut();
+            if move_new_freed {
+                let mut new_free = allocator.free.clone();
+                new_free.subtract(&allocator.all_allocations);
+                allocator.free.subtract(&new_free);
+                allocator.snapshot_free.merge(&new_free).unwrap();
+                new_free = allocator.indirection_free.clone();
+                new_free.subtract(&allocator.all_allocations);
+                allocator.indirection_free.subtract(&new_free);
+                allocator.snapshot_free.merge(&new_free).unwrap();
+            }
             if let Err(e) = allocator.commit() {
                 error!("Commiting allocator error: {e}");
                 self.inner.halt();
