@@ -61,7 +61,6 @@ pub(crate) struct Allocator {
 
 impl MainAllocator {
     pub fn truncate_end(&mut self) -> Result<(), Error> {
-        return Ok(());
         let mut returned = 0;
         let free = self.free.merged()?;
         while let Some((page, span)) = free.last_piece() {
@@ -128,7 +127,7 @@ impl Allocator {
     const INITIAL_ALLOC: PageId = 100;
     const ALLOCATION_BATCH: PageId = 100;
 
-    pub fn new_transaction(inner: &DatabaseInner, multi: bool) -> Result<Allocator, Error> {
+    pub fn new_transaction(inner: &DatabaseInner) -> Result<Allocator, Error> {
         let mut result = Self {
             is_checkpointer: false,
             main: Some(inner.allocator.clone()),

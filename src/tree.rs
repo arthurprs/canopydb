@@ -12,7 +12,6 @@ use crate::{
 use smallvec::SmallVec;
 use std::{
     cell::RefCell,
-    cmp::Ordering,
     ops::{Bound, RangeBounds},
 };
 use triomphe::Arc;
@@ -77,15 +76,24 @@ pub struct Tree<'tx> {
     pub(crate) tx: &'tx Transaction,
     pub(crate) name: Option<Arc<[u8]>>,
     pub(crate) value: TreeValue,
+    pub(crate) len_delta: i64,
     pub(crate) dirty: bool,
     pub(crate) cached_root: RefCell<Option<UntypedNode>>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TreeState {
-    Available { value: TreeValue, dirty: bool },
-    InUse { value: TreeValue },
-    Deleted,
+    Available {
+        value: TreeValue,
+        dirty: bool,
+        len_delta: i64,
+    },
+    InUse {
+        value: TreeValue,
+    },
+    Deleted {
+        value: TreeValue,
+    },
 }
 
 #[derive(Debug)]
@@ -102,6 +110,7 @@ impl std::fmt::Debug for Tree<'_> {
             .field("name", &self.name.as_deref().map(EscapedBytes))
             .field("len", &{ self.value.num_keys })
             .field("level", &self.value.level)
+            .field("len_delta", &self.len_delta)
             .field("dirty", &self.dirty)
             .finish()
     }
@@ -116,6 +125,7 @@ impl Drop for Tree<'_> {
             *self.tx.trees.borrow_mut().get_mut(name).unwrap() = TreeState::Available {
                 value: self.value,
                 dirty: self.dirty,
+                len_delta: self.len_delta,
             };
         }
     }
@@ -150,13 +160,11 @@ impl<'tx> Tree<'tx> {
 
     #[inline]
     fn inc_num_keys(&mut self, delta: i64) {
-        match delta.cmp(&0) {
-            Ordering::Less => self.value.num_keys -= (-delta) as u64,
-            Ordering::Greater => self.value.num_keys += delta as u64,
-            Ordering::Equal => return,
+        if delta != 0 {
+            self.value.num_keys = self.value.num_keys.wrapping_add_signed(delta);
+            self.len_delta += delta;
+            self.dirty = true;
         }
-        self.value.key_delta += delta;
-        self.dirty = true;
     }
 
     #[cfg(any(fuzzing, test))]

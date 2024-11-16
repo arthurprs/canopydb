@@ -1137,19 +1137,19 @@ impl WriteTransaction {
         }
         self.delete_tree(new)?;
         self.mark_dirty();
-        let mut old_state = mem::replace(
-            self.trees.borrow_mut().get_mut(old).unwrap(),
-            TreeState::Deleted,
-        );
-        if let TreeState::Available { dirty, .. } = &mut old_state {
+        let mut trees = self.trees.borrow_mut();
+        let mut old_state = trees.get_mut(old).unwrap();
+        let old_value = if let TreeState::Available { dirty, value, .. } = &mut old_state {
             *dirty = true;
+            *value
         } else {
             unreachable!();
-        }
-        let replaced_new_state = self.trees.borrow_mut().insert(new.into(), old_state);
+        };
+        let old_state = mem::replace(old_state, TreeState::Deleted { value: old_value });
+        let replaced_new_state = trees.insert(new.into(), old_state);
         debug_assert!(matches!(
             replaced_new_state,
-            None | Some(TreeState::Deleted)
+            None | Some(TreeState::Deleted { .. })
         ));
         if let Some(batch) = &mut *self.wal_write_batch.borrow_mut() {
             batch.push_rename_tree(old, new)?;
@@ -1168,7 +1168,12 @@ impl WriteTransaction {
             return Ok(false);
         };
         self.mark_dirty();
-        *self.trees.borrow_mut().get_mut(name).unwrap() = TreeState::Deleted;
+        let mut trees = self.trees.borrow_mut();
+        let state = trees.get_mut(name).unwrap();
+        let &mut TreeState::Available { value, .. } = state else {
+            unreachable!();
+        };
+        *state = TreeState::Deleted { value };
         if let Some(batch) = &mut *self.wal_write_batch.borrow_mut() {
             batch.push_delete_tree(name)?;
         }
@@ -1220,6 +1225,7 @@ impl WriteTransaction {
             name: Some(name),
             value,
             tx: self,
+            len_delta: 0,
             dirty: true,
             cached_root: Default::default(),
         })
@@ -1400,7 +1406,7 @@ impl Transaction {
         let mut commit_lock = inner.commit_lock.lock_arc();
         state.metapage.tx_id += 1;
         trace!("new_write {}", state.metapage.tx_id);
-        let allocator = Allocator::new_transaction(inner, false)?;
+        let allocator = Allocator::new_transaction(inner)?;
         let nodes = commit_lock
             .nodes
             .take()
@@ -1459,7 +1465,7 @@ impl Transaction {
             }
         }
         drop(transactions);
-        let allocator = Allocator::new_transaction(inner, true)?;
+        let allocator = Allocator::new_transaction(inner)?;
         trace!("new_multi_write {}", state.metapage.tx_id);
         let nodes = new_dirty_cache(&inner.opts);
         let trees = HashMap::default();
@@ -1550,6 +1556,7 @@ impl Transaction {
             name: Default::default(),
             value: self.state.get().metapage.trees_tree,
             tx: self,
+            len_delta: 0,
             dirty: false,
             cached_root: Default::default(),
         }
@@ -1560,6 +1567,7 @@ impl Transaction {
             name: Default::default(),
             value: self.state.get().metapage.indirections_tree,
             tx: self,
+            len_delta: 0,
             dirty: false,
             cached_root: Default::default(),
         }
@@ -1883,24 +1891,23 @@ impl Transaction {
         page_id: PageId,
         span: PageId,
         compressed_page: Option<(PageId, PageId)>,
-    ) -> Result<bool, Error> {
-        trace!("free_clean_page_buffer_and_snapshot {page_id} ({span}) {compressed_page:?}");
+    ) -> Result<(), Error> {
+        trace!("free_snapshot_page {page_id} ({span}) {compressed_page:?}");
         let tx_id = self.tx_id();
         let ongoing_snapshot_tx_id = self.state.get().ongoing_snapshot_tx_id;
-        let (target, redirected) = match self
-            .inner
-            .page_table
-            .insert_w_shadowed(tx_id, page_id, None)
-        {
-            Some((from, Item::Page(_))) => {
-                allocator.buffer_free.push(FreePage(from, page_id));
-                if ongoing_snapshot_tx_id.map_or(false, |ockp| from <= ockp) {
-                    (Some(&mut allocator.next_snapshot_free), None)
-                } else {
-                    (None, None)
-                }
+        let is_multi_write = self.is_multi_write_tx();
+        let shadowed =
+            self.inner
+                .page_table
+                .insert_w_shadowed(tx_id, page_id, None, is_multi_write);
+        let (target, redirected) = match shadowed {
+            Some((_from, Item::Page(_))) => {
+                // since this was already determined to be a checkpoint page it can only be for
+                // the ongoing checkpoint.
+                (&mut allocator.next_snapshot_free, None)
             }
             Some((from, Item::Redirected(c_pid, c_span, r_latest))) => {
+                // buffer free handled by checkpointer
                 debug_assert!(r_latest);
                 debug_assert!(page_id.is_compressed());
                 let target = if ongoing_snapshot_tx_id.map_or(false, |ockp| from <= ockp) {
@@ -1908,33 +1915,29 @@ impl Transaction {
                 } else {
                     &mut allocator.snapshot_free
                 };
-                (Some(target), Some((c_pid, c_span)))
+                (target, Some((c_pid, c_span)))
             }
-            None => (Some(&mut allocator.snapshot_free), None),
+            None => {
+                if is_multi_write {
+                    allocator.buffer_free.push(FreePage(tx_id, page_id));
+                }
+                (&mut allocator.snapshot_free, None)
+            }
         };
 
         if page_id.is_compressed() {
             if compressed_page.is_some() && redirected.is_some() {
-                assert_eq!(compressed_page, redirected);
+                debug_assert_eq!(compressed_page, redirected);
+            }
+            target.free(page_id, 1)?;
+            if let Some((c_pid, c_span)) = compressed_page.or(redirected) {
+                target.free(c_pid, c_span)?;
             }
         } else {
-            assert_eq!(compressed_page, None);
-            assert_eq!(redirected, None);
+            debug_assert_eq!(compressed_page.or(redirected), None);
+            target.free(page_id, span)?;
         }
-
-        if let Some(target) = target {
-            if page_id.is_compressed() {
-                target.free(page_id, 1)?;
-                if let Some((c_pid, c_span)) = compressed_page.or(redirected) {
-                    target.free(c_pid, c_span)?;
-                }
-            } else {
-                target.free(page_id, span)?;
-            }
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        Ok(())
     }
 
     #[inline]
@@ -1986,15 +1989,6 @@ impl Transaction {
             .insert_with_lifecycle(node_mut.id(), TxNode::Popped(node_mut.page_size() as u64));
         self.spill_dirty_nodes(spilled)?;
         Ok(node_mut)
-    }
-
-    fn any_writers_before(&self) -> bool {
-        self.inner
-            .transactions
-            .lock()
-            .iter()
-            .take_while(|o| o.tx_id < self.tx_id())
-            .any(|o| o.writers > (Some(o.tx_id) == self.tracked_transaction) as u32)
     }
 
     #[cold]
@@ -2145,40 +2139,38 @@ impl Transaction {
     fn commit_dirty_nodes(&mut self) -> Result<(), Error> {
         self.flags.get_mut().insert(TF::PAGE_TABLE_DIRTY);
         let tx_id = self.tx_id();
+        let is_multi_write = self.is_multi_write_tx();
         let mut nodes = self.nodes.borrow_mut();
         let allocator = &mut self.allocator.borrow_mut();
         allocator.buffer_free.reserve_exact(nodes.len());
         for (page_id, node) in nodes.drain() {
-            match node {
+            let shadowed = match node {
                 TxNode::Stashed(node) => {
                     trace!("commit_dirty_nodes insert {}", node.id());
                     debug_assert!(node.dirty);
                     debug_assert!(node.num_keys() != 0, "Invalid node {node:#?}");
                     let mut page = node.into_page();
                     page.dirty = false;
-                    let shadowed = self
-                        .inner
+                    self.inner
                         .page_table
-                        .insert(tx_id, page.id(), Item::Page(page));
-                    if let Some(from) = shadowed {
-                        allocator.buffer_free.push(FreePage(from, page_id));
-                    }
+                        .insert(tx_id, page.id(), Item::Page(page), false)
                 }
                 TxNode::Spilled {
                     compressed_page, ..
                 } => {
                     trace!("commit_dirty_nodes spilled {page_id}");
-                    let shadowed = if let Some((c_pid, c_span)) = compressed_page {
+                    if let Some((c_pid, c_span)) = compressed_page {
                         self.inner.page_table.insert(
                             tx_id,
                             page_id,
                             Item::Redirected(c_pid, c_span, true),
+                            false,
                         )
                     } else {
-                        self.inner.page_table.insert(tx_id, page_id, None)
-                    };
-                    if let Some(from) = shadowed {
-                        allocator.buffer_free.push(FreePage(from, page_id));
+                        self.inner
+                            .page_table
+                            .insert(tx_id, page_id, None, is_multi_write)
+                            .or(is_multi_write.then_some(self.tx_id()))
                     }
                 }
                 TxNode::Freed {
@@ -2188,20 +2180,19 @@ impl Transaction {
                 } => {
                     trace!("commit_dirty_nodes freed {page_id}");
                     if from_snapshot {
-                        self.free_snapshot_page(
-                            allocator,
-                            page_id,
-                            span,
-                            compressed_page,
-                        )?;
+                        self.free_snapshot_page(allocator, page_id, span, compressed_page)?;
+                        None
                     } else {
-                        let shadowed = self.inner.page_table.insert(tx_id, page_id, None);
-                        if let Some(from) = shadowed {
-                            allocator.buffer_free.push(FreePage(from, page_id));
-                        }
+                        self.inner
+                            .page_table
+                            .insert(tx_id, page_id, None, is_multi_write)
+                            .or(is_multi_write.then_some(self.tx_id()))
                     }
                 }
                 TxNode::Popped(..) => unreachable!("page {page_id} isn't stashed"),
+            };
+            if let Some(from) = shadowed {
+                allocator.buffer_free.push(FreePage(from, page_id));
             }
         }
         Ok(())
@@ -2353,6 +2344,7 @@ impl Transaction {
 
     fn commit_start(&mut self) -> Result<(), Error> {
         debug_assert!(self.is_write_tx());
+        let mut check_conflicts = false;
         if self.is_multi_write_tx() {
             trace!(
                 "MultiWrite Commit start {}",
@@ -2361,81 +2353,98 @@ impl Transaction {
             self.commit_lock = Some(self.inner.commit_lock.lock_arc());
             let latest_state = *self.inner.state.lock();
             latest_state.check_halted()?;
-            if self.tx_id() == latest_state.metapage.tx_id {
-                self.flags.get_mut().remove(TF::MULTI_WRITE_TX);
-            } else {
+            if self.tx_id() != latest_state.metapage.tx_id {
                 if self.check_conflicts() {
                     return Err(Error::WriteConflict);
                 }
                 self.state.get_mut().metapage = latest_state.metapage;
+                check_conflicts = true;
             }
             self.state.get_mut().metapage.tx_id += 1;
         }
 
         trace!("Commit start {}", self.state.get_mut().metapage.tx_id);
         self.trap.check()?;
-
         // Commit the dirty trees but also leave it in a clean state in case we end up caching it later
         let mut tx_trees = mem::take(self.trees.get_mut());
         let mut trees_tree = self.get_trees_tree();
         let mut had_clean = false;
+
+        let cached_trees = self.commit_lock.as_ref().unwrap().trees.as_ref();
+        let get_existing_tree_value =
+            |trees_tree: &Tree<'_>, tree_name: &[u8]| -> Result<Option<TreeValue>, Error> {
+                if let Some(TreeState::Available { value, .. }) =
+                    cached_trees.and_then(|t| t.get(tree_name))
+                {
+                    return Ok(Some(*value));
+                }
+                Ok(trees_tree.get(tree_name)?.map(|v| {
+                    *Ref::<_, TreeValue>::new_unaligned(v.as_ref())
+                        .unwrap()
+                        .into_ref()
+                }))
+            };
+
         for (tree_name, tree_state) in &mut tx_trees {
             match tree_state {
                 TreeState::Available { dirty: false, .. } => {
                     had_clean = true;
                 }
-                TreeState::Available { value, dirty } if !self.is_multi_write_tx() => {
-                    *dirty = false;
-                    value.key_delta = 0;
+                TreeState::Available {
+                    value,
+                    dirty,
+                    len_delta,
+                } if !check_conflicts => {
                     trees_tree.insert(tree_name, value.as_bytes())?;
-                }
-                TreeState::Available { value, dirty } => {
                     *dirty = false;
-                    let existing = trees_tree.get(tree_name)?.map(|v| {
-                        *Ref::<_, TreeValue>::new_unaligned(v.as_ref())
-                            .unwrap()
-                            .into_ref()
-                    });
+                    *len_delta = 0;
+                }
+                TreeState::Available {
+                    value,
+                    dirty,
+                    len_delta,
+                } => {
+                    let existing = get_existing_tree_value(&trees_tree, tree_name)?;
                     let mut merged = existing.unwrap_or(*value);
-                    if merged.id != value.id {
-                        return Err(Error::WriteConflict);
-                    }
                     let needs_update;
                     if existing.is_some() {
-                        if u64::try_from(value.key_delta).ok() == Some(value.num_keys)
-                            && merged.root != PageId::default()
-                        {
+                        if merged.id != value.id {
                             return Err(Error::WriteConflict);
                         }
-                        if merged.root != value.root
-                            && merged.root != PageId::default()
-                            && self.nodes.borrow().peek(&{ merged.root }).is_none()
-                        {
+                        if merged.root != PageId::default() && merged.root != value.root {
                             return Err(Error::WriteConflict);
                         }
                         needs_update = merged.root != value.root
                             || merged.level != value.level
-                            || value.key_delta != 0;
+                            || *len_delta != 0;
                         merged.root = value.root;
                         merged.level = value.level;
-                        merged.num_keys = merged.num_keys.wrapping_add_signed(value.key_delta);
+                        merged.num_keys = merged.num_keys.wrapping_add_signed(*len_delta);
                     } else {
                         needs_update = true;
                     }
                     if needs_update {
                         *value = merged;
-                        value.key_delta = 0;
                         trees_tree.insert(tree_name, value.as_bytes())?;
                     }
+                    *dirty = false;
+                    *len_delta = 0;
                 }
-                TreeState::Deleted => {
+                TreeState::Deleted { value } => {
+                    if check_conflicts {
+                        if let Some(existing) = get_existing_tree_value(&trees_tree, tree_name)? {
+                            if existing.id != value.id {
+                                return Err(Error::WriteConflict);
+                            }
+                        }
+                    }
                     trees_tree.delete(tree_name)?;
                 }
                 TreeState::InUse { .. } => unreachable!(),
             }
         }
         // clean trees could be outdated, so we won't leave anything for caching
-        if had_clean && self.is_multi_write_tx() {
+        if had_clean && check_conflicts {
             tx_trees.clear();
         }
         let trees_value = trees_tree.value;
@@ -2484,9 +2493,9 @@ impl Transaction {
         // Any failures after setting DONE are fatal
         self.flags.get_mut().insert(TF::DONE);
         {
-            let move_new_freed = self.tracked_transaction.is_some() && self.any_writers_before();
+            let is_multi_write_tx = self.is_multi_write_tx();
             let allocator = self.allocator.get_mut();
-            if move_new_freed {
+            if is_multi_write_tx {
                 let mut new_free = allocator.free.clone();
                 new_free.subtract(&allocator.all_allocations);
                 allocator.free.subtract(&new_free);
@@ -2523,13 +2532,13 @@ impl Transaction {
         if let Some(mut write_lock) = self.commit_lock.take() {
             // Release write lock and move the write state into it
             // TODO: consider limiting the size of some of these
-            // write_lock.nodes = Some(mem::replace(self.nodes.get_mut(), void_dirty_cache()));
-            // write_lock.trees = Some(mem::take(self.trees.get_mut()));
-            // write_lock.scratch_buffer = mem::take(self.scratch_buffer.get_mut());
-            // write_lock.wal_write_batch = self.wal_write_batch.get_mut().take().map(|mut wb| {
-            //     wb.clear();
-            //     wb
-            // });
+            write_lock.nodes = Some(mem::replace(self.nodes.get_mut(), void_dirty_cache()));
+            write_lock.trees = Some(mem::take(self.trees.get_mut()));
+            write_lock.scratch_buffer = mem::take(self.scratch_buffer.get_mut());
+            write_lock.wal_write_batch = self.wal_write_batch.get_mut().take().map(|mut wb| {
+                wb.clear();
+                wb
+            });
         }
         self.multi_write_lock = None;
         self.exclusive_write_lock = None;
@@ -2569,20 +2578,27 @@ impl Transaction {
     fn get_tree_by_id(&self, id: TreeId) -> Result<Option<Tree<'_>>, Error> {
         for (name, state) in self.trees.borrow_mut().iter_mut() {
             match *state {
-                TreeState::Available { value, dirty } if value.id == id => {
+                TreeState::Available {
+                    value,
+                    dirty,
+                    len_delta,
+                } if value.id == id => {
                     *state = TreeState::InUse { value };
                     return Ok(Some(Tree {
                         name: Some(name.clone()),
                         value,
                         tx: self,
                         dirty,
+                        len_delta,
                         cached_root: Default::default(),
                     }));
                 }
                 TreeState::InUse { value } if value.id == id => {
                     return Err(Error::TreeAlreadyOpen(format!("<id: {id}>").into()));
                 }
-                TreeState::Deleted | TreeState::Available { .. } | TreeState::InUse { .. } => (),
+                TreeState::Deleted { .. }
+                | TreeState::Available { .. }
+                | TreeState::InUse { .. } => (),
             }
         }
 
@@ -2609,17 +2625,22 @@ impl Transaction {
                 self.trees.borrow_mut().entry_ref(name)
             {
                 match *o.get() {
-                    TreeState::Available { value, dirty } => {
+                    TreeState::Available {
+                        value,
+                        dirty,
+                        len_delta,
+                    } => {
                         *o.get_mut() = TreeState::InUse { value };
                         return Ok(Some(Tree {
                             name: Some(o.key().clone()),
                             value,
                             tx: self,
                             dirty,
+                            len_delta,
                             cached_root: Default::default(),
                         }));
                     }
-                    TreeState::Deleted => {
+                    TreeState::Deleted { .. } => {
                         return Ok(None);
                     }
                     TreeState::InUse { .. } => {
@@ -2644,6 +2665,7 @@ impl Transaction {
                 value,
                 tx: self,
                 dirty: false,
+                len_delta: 0,
                 cached_root: Default::default(),
             }))
         } else {
@@ -2989,7 +3011,7 @@ impl DatabaseInner {
         let compressed_page_id = allocator.allocate(compressed_span)?;
 
         trace!(
-            "Compressing page {} into {}. Compression ratio {:.2}x effective {:.2}x {} -> {} pages",
+            "Compressing page {} -> {}, ratio {:.2}x, effective {:.2}x, {} -> {} pages",
             page.id(),
             compressed_page_id,
             page.raw_data.len() as f64 / compressed_len as f64,

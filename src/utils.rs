@@ -422,7 +422,7 @@ impl Trap {
     }
 }
 
-impl<'a> TrapGuard<'a> {
+impl TrapGuard<'_> {
     #[inline]
     pub fn disarm(mut self) {
         debug_assert!(self.0.is_some());
@@ -430,7 +430,7 @@ impl<'a> TrapGuard<'a> {
     }
 }
 
-impl<'a> Drop for TrapGuard<'a> {
+impl Drop for TrapGuard<'_> {
     #[inline]
     fn drop(&mut self) {
         if let Some(arc) = &self.0 {

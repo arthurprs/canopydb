@@ -900,12 +900,12 @@ impl Freelist {
 
     pub fn allocate(&mut self, span: PageId) -> Option<PageId> {
         debug_assert_ne!(span, 0);
-        if span == 0 || span > MAX_ALLOCATION_SPAN || self.shards.is_none() {
+        if span == 0 || span > MAX_ALLOCATION_SPAN {
             return None;
         }
         #[cfg(debug_assertions)]
         let len_before = self.len();
-        let shards = Arc::make_mut(self.shards.get_or_insert_with(Default::default));
+        let shards = Arc::make_mut(self.shards.as_mut()?);
         let mut result = None;
         if span <= SHARD_MAX_LEN {
             let mut i = 0;
@@ -961,11 +961,21 @@ impl Freelist {
     }
 
     pub fn subtract(&mut self, other: &Self) {
-        if self.is_empty() {
+        let Some((shards, other_shards)) = self.shards.as_mut().zip(other.shards.as_deref()) else {
             return;
-        }
-        for (page_id, span) in other.iter_spans() {
-            self.remove(page_id, span);
+        };
+        for other_shard in other_shards {
+            let Ok(shard_pos) = shards.binary_search_by_key(&other_shard.base, |s| s.base) else {
+                continue;
+            };
+            let shards = Arc::make_mut(shards);
+            let shard = &mut shards[shard_pos];
+            for (page_id, span) in other_shard.iter_spans() {
+                shard.remove(page_id, span);
+            }
+            if shard.is_empty() {
+                shards.remove(shard_pos);
+            }
         }
         #[cfg(any(test, fuzzing))]
         debug_assert!(self.validate());

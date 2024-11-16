@@ -250,7 +250,6 @@ pub struct TreeValue {
     pub id: TreeId,
     pub root: PageId,
     pub num_keys: u64,
-    pub key_delta: i64,
     pub level: u8,
     pub min_branch_node_pages: u8,
     pub min_leaf_node_pages: u8,
@@ -266,7 +265,6 @@ impl std::fmt::Debug for TreeValue {
             .field("id", &{ self.id })
             .field("root", &{ self.root })
             .field("num_keys", &{ self.num_keys })
-            .field("key_delta", &{ self.key_delta })
             .field("nodes_compressed", &self.nodes_compressed)
             .field("overflow_compressed", &self.overflow_compressed)
             .field("min_branch_node_pages", &self.min_branch_node_pages)

@@ -379,7 +379,6 @@ impl TreeOptions {
             fixed_value_len: self.fixed_value_len,
             level: 0,
             num_keys: 0,
-            key_delta: 0,
             nodes_compressed,
             overflow_compressed,
         }
