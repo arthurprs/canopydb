@@ -300,16 +300,16 @@ impl Actor {
                     Err(e) => error!("commit failed: {e}"),
                 }
                 Self::validate(state, &state.model, &state.db.begin_read().unwrap());
-                // if state.always_validate || tx_id % 8 == 0 {
-                //     match state.db.validate_free_space() {
-                //         Ok(()) | Err(Error::DatabaseHalted) => (),
-                //         Err(e) => panic!("{e}"),
-                //     }
-                // }
                 state.writers.remove(&self.id);
                 if !self.op_queue.is_empty() {
                     self.enqueued = true;
                     state.read_queue.push_back(self.id);
+                }
+                if (state.always_validate || tx_id % 8 == 0) && state.writers.is_empty() {
+                    match state.db.validate_free_space() {
+                        Ok(()) | Err(Error::DatabaseHalted) => (),
+                        Err(e) => panic!("{e}"),
+                    }
                 }
                 true
             }
@@ -465,9 +465,9 @@ impl Actor {
                     }
                 }
                 drop(tree);
-                // if state.always_validate {
-                //     Self::validate(state, &model, tx);
-                // }
+                if state.always_validate {
+                    Self::validate(state, &model, tx);
+                }
                 false
             }
         }

@@ -915,6 +915,7 @@ impl Freelist {
                     if shard.is_empty() {
                         shards.remove(i);
                     }
+                    #[cfg(debug_assertions)]
                     debug_assert_eq!(len_before - span, self.len());
                     result = Some(p);
                     break;
@@ -928,6 +929,7 @@ impl Freelist {
         } else {
             result = Self::allocate_cross_shard(shards, span, 0..shards.len());
         }
+        #[cfg(debug_assertions)]
         debug_assert_eq!(len_before - result.map_or(0, |_| span), self.len());
         #[cfg(any(test, fuzzing))]
         debug_assert!(self.validate());
@@ -956,6 +958,7 @@ impl Freelist {
             span -= span_for_shard;
             page_id += span_for_shard;
         }
+        #[cfg(debug_assertions)]
         debug_assert_eq!(len_before - self.len(), removed);
         removed
     }
