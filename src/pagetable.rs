@@ -252,6 +252,7 @@ impl PageTable {
     }
 
     pub fn is_latest_from_lte(&self, tx_id: TxId, page_id: PageId) -> bool {
+        trace!("is_latest_from_lte tx_id {tx_id} page {page_id}");
         if let Some(values) = self.table.get(&page_id) {
             values.last().map_or(true, |&(from, _)| from <= tx_id)
         } else {

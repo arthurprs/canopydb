@@ -1465,8 +1465,8 @@ impl Transaction {
             }
         }
         drop(transactions);
-        let allocator = Allocator::new_transaction(inner)?;
         trace!("new_multi_write {}", state.metapage.tx_id);
+        let allocator = Allocator::new_transaction(inner)?;
         let nodes = new_dirty_cache(&inner.opts);
         let trees = HashMap::default();
         Ok(WriteTransaction(Transaction {
@@ -2170,7 +2170,7 @@ impl Transaction {
                         self.inner
                             .page_table
                             .insert(tx_id, page_id, None, is_multi_write)
-                            .or(is_multi_write.then_some(self.tx_id()))
+                            .or(is_multi_write.then_some(tx_id))
                     }
                 }
                 TxNode::Freed {
@@ -2186,7 +2186,7 @@ impl Transaction {
                         self.inner
                             .page_table
                             .insert(tx_id, page_id, None, is_multi_write)
-                            .or(is_multi_write.then_some(self.tx_id()))
+                            .or(is_multi_write.then_some(tx_id))
                     }
                 }
                 TxNode::Popped(..) => unreachable!("page {page_id} isn't stashed"),
@@ -2233,7 +2233,7 @@ impl Transaction {
         trace!("release_free_buffers agressive {agressive:?}");
         debug_assert!(self.is_write_tx());
 
-        let earliest_tx_needed = self.tracked_transaction.unwrap_or_else(|| self.tx_id() - 1);
+        let mut earliest_tx_needed = self.tracked_transaction.unwrap_or_else(|| self.tx_id() - 1);
         // Drop of old Read/Checkpoint transactions is responsible for
         // tail cleanup, we only have to attempt it here if there aren't any.
         if self.tracked_transaction.is_none() && self.inner.transactions.lock().is_empty() {
@@ -2244,36 +2244,44 @@ impl Transaction {
             return;
         }
         let mut to_free = SmallVec::<FreePage, 15>::new();
-        let mut emptied = SmallVec::<TxId, 8>::new();
-        let mut transactions = SmallVec::<TxId, 8>::from_iter(
-            self.inner.transactions.lock().iter().map(|ot| ot.tx_id),
-        )
-        .into_iter()
-        .peekable();
+        let mut emptied = SmallVec::<TxId, 7>::new();
+        let locked_transactions = self.inner.transactions.lock();
+        let mut open_transactions =
+            SmallVec::<TxId, 12>::from_iter(locked_transactions.iter().map(|ot| ot.tx_id))
+                .into_iter()
+                .peekable();
+        if self.is_multi_write_tx() {
+            earliest_tx_needed = locked_transactions
+                .iter()
+                .find_map(|ot| (ot.writers != 0).then_some(ot.tx_id))
+                .unwrap_or(earliest_tx_needed);
+        }
+        drop(locked_transactions);
+        // Last open tx <= releasing_tx_id
+        let mut last_open_tx_lte = 0;
         let mut locked_free_buffers = self.inner.free_buffers.lock();
-        let mut previous_tx_id = 0;
         let free_buffers = &mut *locked_free_buffers;
         for (&releasing_tx_id, pending) in free_buffers.free.range_mut(free_buffers.scan_from..) {
-            if releasing_tx_id >= earliest_tx_needed {
+            if releasing_tx_id > earliest_tx_needed {
                 break;
             }
-            while let Some(&t) = transactions.peek() {
+            while let Some(&t) = open_transactions.peek() {
                 if t <= releasing_tx_id {
-                    previous_tx_id = t;
-                    transactions.next();
+                    last_open_tx_lte = t;
+                    open_transactions.next();
                 } else {
                     break;
                 }
             }
-            // visible_from inside pending is `< releasing_tx_id` and can be removed if `visible_from > previous_tx_id`.
+            // visible_from inside pending is <= releasing_tx_id and can be removed if `visible_from > last_open_tx`.
             // Thus the buffer can be removed if `visible_from` is between `previous_tx_id(ex) and releasing_tx_id(ex)`.
             // We can detect if that range is empty and bail early.
-            if previous_tx_id + 1 >= releasing_tx_id {
+            if last_open_tx_lte + 1 >= releasing_tx_id {
                 continue;
             }
             to_free.extend(utils::vec_drain_if(
                 pending,
-                |&FreePage(visible_from, _)| visible_from > previous_tx_id,
+                |&FreePage(visible_from, _)| visible_from > last_open_tx_lte,
             ));
             if pending.is_empty() {
                 emptied.push(releasing_tx_id);
@@ -2496,6 +2504,7 @@ impl Transaction {
             let is_multi_write_tx = self.is_multi_write_tx();
             let allocator = self.allocator.get_mut();
             if is_multi_write_tx {
+                // FIXME: move to pending free instead?
                 let mut new_free = allocator.free.clone();
                 new_free.subtract(&allocator.all_allocations);
                 allocator.free.subtract(&new_free);
