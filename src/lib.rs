@@ -696,7 +696,7 @@ impl Database {
         #[cfg(all(any(fuzzing, test), debug_assertions))]
         db.validate_free_space().unwrap();
         let db_recovery = DatabaseRecovery {
-            tx: Transaction::new_write(&db.inner, false)?,
+            tx: Transaction::new_write(&db.inner, false, false)?,
             db,
             batches_recovered: Default::default(),
             ops_recovered: Default::default(),
@@ -944,21 +944,33 @@ impl Database {
         self.inner.env.wal.sync()
     }
 
-    /// Begins a Write transaction.
+    /// Begins an Exclusive Write transaction. Equivalent to `begin_write_with(false)`
     ///
-    /// Only one active write transaction can be active at a given time (similar to a Mutex).
-    /// This property is automatically enforced by the Database.
     /// The returned transaction must be committed for the changes to be persisted.
+    #[inline]
     pub fn begin_write(&self) -> Result<WriteTransaction, Error> {
+        self.begin_write_with(false)
+    }
+
+    /// Begins a write transactions
+    ///
+    /// If multi is set to true the returned transaction may run concurrently with other
+    /// multi write transactions. These transactions run under optimistic concurrency control
+    /// and Snapshot-Isolation, see [`WriteTransaction`] for details.
+    ///
+    /// If multi is false then the transactions runs in exclusive mode with Serializable-Snapshot-Isolation (SSI).
+    ///  
+    /// The returned transaction must be committed for the changes to be persisted.
+    pub fn begin_write_with(&self, multi: bool) -> Result<WriteTransaction, Error> {
         let throttle_spans = self.inner.opts.throttle_memory_limit / PAGE_SIZE as usize;
-        let mut tx = Transaction::new_multi_write(&self.inner, true)?;
+        let mut tx = Transaction::new_write(&self.inner, multi, true)?;
         tx.release_free_buffers(tx.inner.page_table.spans_used() >= throttle_spans);
         if tx.inner.page_table.spans_used() >= throttle_spans {
             // drop tx to avoid deadlocking with checkpoints
             drop(tx);
             info!("Throttling write tx");
             thread::sleep(Duration::from_micros(100));
-            tx = Transaction::new_multi_write(&self.inner, true)?;
+            tx = Transaction::new_write(&self.inner, multi, true)?;
             while {
                 tx.release_free_buffers(true);
                 tx.inner.page_table.spans_used()
@@ -973,7 +985,7 @@ impl Database {
                 thread::sleep(Duration::from_micros(100));
                 // Wait for the ongoing checkpoint to finish.
                 self.inner.wait_checkpoint();
-                tx = Transaction::new_multi_write(&self.inner, true)?;
+                tx = Transaction::new_write(&self.inner, multi, true)?;
             }
             debug!("Resuming write tx after throttling");
         }
@@ -1076,7 +1088,7 @@ impl Database {
                 "Compaction pass {pass}, current size {}",
                 ByteSize(curr_file_size)
             );
-            let mut tx = Transaction::new_write(&self.inner, false)?;
+            let mut tx = Transaction::new_write(&self.inner, false, false)?;
             match tx.compact() {
                 Ok(true) => (),
                 Ok(false) | Err(Error::CantCompact) => break,
@@ -1111,7 +1123,7 @@ impl Database {
     fn force_checkpoint(&self) -> Result<(), Error> {
         let mut metapage = self.inner.state.lock().metapage;
         if metapage.tx_id <= metapage.snapshot_tx_id {
-            let tx = Transaction::new_write(&self.inner, false)?;
+            let tx = Transaction::new_write(&self.inner, false, false)?;
             metapage.tx_id = tx.tx_id();
             tx.mark_dirty();
             tx.commit()?;
@@ -1386,104 +1398,90 @@ impl Drop for Transaction {
 }
 
 impl Transaction {
-    fn new_write(inner: &SharedDatabaseInner, user_txn: bool) -> Result<WriteTransaction, Error> {
+    fn new_write(
+        inner: &SharedDatabaseInner,
+        multi: bool,
+        user_txn: bool,
+    ) -> Result<WriteTransaction, Error> {
+        let mut exclusive_write_lock = None;
+        let mut multi_write_lock = None;
         let mut transactions;
-        let mut write_lock;
         let mut state;
         loop {
-            write_lock = inner.write_lock.write_arc();
+            if multi {
+                multi_write_lock = Some(inner.write_lock.read_arc());
+            } else {
+                exclusive_write_lock = Some(inner.write_lock.write_arc());
+            }
             transactions = inner.transactions.lock();
             state = *inner.state.lock();
             state.check_halted()?;
             if !user_txn || !state.block_user_transactions {
                 break;
             }
-            drop(write_lock);
+            exclusive_write_lock = None;
+            multi_write_lock = None;
             debug!("new_write waiting for user_transactions to be allowed");
             inner.transactions_condvar.wait(&mut transactions);
             drop(transactions);
         }
-        drop(transactions);
-        let mut commit_lock = inner.commit_lock.lock_arc();
-        trace!("new_write {}", state.metapage.tx_id);
-        let allocator = Allocator::new_transaction(inner)?;
-        let nodes = commit_lock
-            .nodes
-            .take()
-            .unwrap_or_else(|| new_dirty_cache(&inner.opts));
-        Ok(WriteTransaction(Transaction {
-            flags: TF::WRITE_TX.into(),
-            trap: Default::default(),
-            allocator: RefCell::new(allocator),
-            inner: ManuallyDrop::new(inner.clone()),
-            state: Cell::new(state),
-            trees: RefCell::new(commit_lock.trees.take().unwrap_or_default()),
-            nodes: RefCell::new(nodes),
-            tracked_transaction: Default::default(),
-            nodes_spilled_span: Default::default(),
-            wal_write_batch: Default::default(),
-            scratch_buffer: RefCell::new(mem::take(&mut commit_lock.scratch_buffer)),
-            exclusive_write_lock: Some(write_lock),
-            multi_write_lock: None,
-            commit_lock: Some(commit_lock),
-            env_handle: user_txn.then(|| inner.open.lock().clone()).flatten(),
-        }))
-    }
-
-    fn new_multi_write(
-        inner: &SharedDatabaseInner,
-        user_txn: bool,
-    ) -> Result<WriteTransaction, Error> {
-        let mut transactions;
-        let mut write_lock;
-        let mut state;
-        loop {
-            write_lock = inner.write_lock.read_arc();
-            transactions = inner.transactions.lock();
-            state = *inner.state.lock();
-            state.check_halted()?;
-            if !user_txn || !state.block_user_transactions {
-                break;
+        let trees;
+        let nodes;
+        let scratch_buffer;
+        let tracked_transaction;
+        let flags;
+        let commit_lock = if multi {
+            match transactions.last_mut() {
+                Some(l) if l.tx_id == state.metapage.tx_id => {
+                    l.ref_count += 1;
+                    l.writers += 1;
+                }
+                _ => {
+                    transactions.push(OpenTxn {
+                        tx_id: state.metapage.tx_id,
+                        ref_count: 1,
+                        writers: 1,
+                        earliest_snapshot_tx_id: state.metapage.snapshot_tx_id,
+                    });
+                }
             }
-            drop(write_lock);
-            debug!("new_multi_write waiting for user_transactions to be allowed");
-            inner.transactions_condvar.wait(&mut transactions);
             drop(transactions);
-        }
-        match transactions.last_mut() {
-            Some(l) if l.tx_id == state.metapage.tx_id => {
-                l.ref_count += 1;
-                l.writers += 1;
-            }
-            _ => {
-                transactions.push(OpenTxn {
-                    tx_id: state.metapage.tx_id,
-                    ref_count: 1,
-                    writers: 1,
-                    earliest_snapshot_tx_id: state.metapage.snapshot_tx_id,
-                });
-            }
-        }
-        drop(transactions);
-        trace!("new_multi_write {}", state.metapage.tx_id);
+            tracked_transaction = Some(state.metapage.tx_id);
+            flags = TF::WRITE_TX | TF::MULTI_WRITE_TX;
+            trees = None;
+            nodes = None;
+            scratch_buffer = Default::default();
+            None
+        } else {
+            drop(transactions);
+            tracked_transaction = None;
+            flags = TF::WRITE_TX;
+            let mut commit_lock = inner.commit_lock.lock_arc();
+            trees = commit_lock.trees.take();
+            nodes = commit_lock.nodes.take();
+            scratch_buffer = mem::take(&mut commit_lock.scratch_buffer);
+            Some(commit_lock)
+        };
+        trace!(
+            "new_write {} multi {multi:?} user {user_txn:?}",
+            state.metapage.tx_id
+        );
         let allocator = Allocator::new_transaction(inner)?;
-        let nodes = new_dirty_cache(&inner.opts);
-        let trees = HashMap::default();
         Ok(WriteTransaction(Transaction {
-            flags: (TF::MULTI_WRITE_TX | TF::WRITE_TX).into(),
+            flags: Cell::new(flags),
             trap: Default::default(),
             allocator: RefCell::new(allocator),
             inner: ManuallyDrop::new(inner.clone()),
             state: Cell::new(state),
-            trees: RefCell::new(trees),
-            nodes: RefCell::new(nodes),
+            trees: RefCell::new(trees.unwrap_or_default()),
+            nodes: RefCell::new(nodes.unwrap_or_else(|| new_dirty_cache(&inner.opts))),
+            scratch_buffer: RefCell::new(scratch_buffer),
+            tracked_transaction,
             nodes_spilled_span: Default::default(),
             wal_write_batch: Default::default(),
-            scratch_buffer: Default::default(),
-            tracked_transaction: Some(state.metapage.tx_id),
-            exclusive_write_lock: None,
-            multi_write_lock: Some(write_lock),
-            commit_lock: None,
+            exclusive_write_lock,
+            multi_write_lock,
+            commit_lock,
             env_handle: user_txn.then(|| inner.open.lock().clone()).flatten(),
         }))
     }

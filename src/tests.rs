@@ -574,7 +574,7 @@ fn multi_writer() {
     let env = Environment::with_options(options).unwrap();
 
     let db1 = env.get_or_create_database("db1").unwrap();
-    let tx1 = db1.begin_write().unwrap();
+    let tx1 = db1.begin_write_with(true).unwrap();
     let mut tree1 = tx1.get_or_create_tree(b"my_tree").unwrap();
     for i in 0..200 {
         tree1.insert(format!("foo{i}").as_bytes(), b"bar").unwrap();
@@ -582,8 +582,8 @@ fn multi_writer() {
     drop(tree1);
     tx1.commit().unwrap();
     // Each database unique write transaction is independent.
-    let tx1 = db1.begin_write().unwrap();
-    let tx2 = db1.begin_write().unwrap();
+    let tx1 = db1.begin_write_with(true).unwrap();
+    let tx2 = db1.begin_write_with(true).unwrap();
     let mut tree1 = tx1.get_or_create_tree(b"my_tree").unwrap();
     let mut tree2 = tx2.get_or_create_tree(b"my_tree").unwrap();
     tree1.insert(b"foo0", b"bar").unwrap();
