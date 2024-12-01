@@ -1098,8 +1098,7 @@ fn recover_then_checkpoint() {
             tree.insert(k.as_bytes(), v.as_bytes()).unwrap();
         }
         drop(tree);
-        latest_tx_id = tx.tx_id();
-        tx.commit().unwrap();
+        latest_tx_id = tx.commit().unwrap();
         master_sample.extend(sample.into_iter());
     }
 
@@ -1164,8 +1163,7 @@ fn recovery() {
             tree.insert(k.as_bytes(), v.as_bytes()).unwrap();
         }
         drop(tree);
-        latest_tx_id = tx.tx_id();
-        tx.commit().unwrap();
+        latest_tx_id = tx.commit().unwrap();
         master_sample.extend(sample.into_iter());
     }
 

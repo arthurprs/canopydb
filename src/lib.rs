@@ -1077,14 +1077,17 @@ impl Database {
                 ByteSize(curr_file_size)
             );
             let mut tx = Transaction::new_write(&self.inner, false)?;
-            let tx_id = tx.tx_id();
-            if let Ok(false) | Err(Error::CantCompact) = tx.compact() {
-                break;
+            match tx.compact() {
+                Ok(true) => (),
+                Ok(false) | Err(Error::CantCompact) => break,
+                Err(e) => return Err(e),
             }
-            if let Err(Error::CantCompact) = tx.commit() {
-                break;
-            }
-            self.checkpoint_internal(Some(tx_id))?;
+            let tx_id = match tx.commit() {
+                Ok(tx_id) => tx_id,
+                Err(Error::CantCompact) => break,
+                Err(e) => return Err(e),
+            };
+            self.checkpoint_internal(Some(tx_id + 1))?;
             // Theoretically one extra checkpoint would be sufficient, but the logic for file shrinking
             // in the allocator is quite limited and depends on the main checkpointer truncating the end.
             for _ in 0..2 {
@@ -1231,7 +1234,7 @@ impl WriteTransaction {
         })
     }
 
-    /// Commits the transaction
+    /// Commits the transaction. See [Self::commit_with] for details.
     ///
     /// Equivalent to [Self::commit_with] with the sync argument from [DbOptions::default_commit_sync]
     #[inline]
@@ -1241,11 +1244,10 @@ impl WriteTransaction {
     }
 
     /// Commits the transaction and optionally performs a durable `fsync` to make the transaction
-    /// (and all the ones before it) durable in the storage.
+    /// (and all the ones before it) durable in the storage. Returns the new TxId.
     ///
-    /// Note that transactions that commiting transactions that aren't dirty (see [WriteTransaction::is_dirty])
-    /// are equivalent to a rollback (nothing is affected, e.g. the next WriteTransaction will have the
-    /// same Transaction Id).
+    /// Note that transactions that aren't dirty (see [WriteTransaction::is_dirty]) are equivalent
+    /// to a rollback (nothing is affected and the result will the be original TxId).
     pub fn commit_with(mut self, sync: bool) -> Result<TxId, Error> {
         debug_assert!(self.is_write_tx());
         if !self.is_dirty() {
@@ -1403,7 +1405,6 @@ impl Transaction {
         }
         drop(transactions);
         let mut commit_lock = inner.commit_lock.lock_arc();
-        state.metapage.tx_id += 1;
         trace!("new_write {}", state.metapage.tx_id);
         let allocator = Allocator::new_transaction(inner)?;
         let nodes = commit_lock
@@ -2232,10 +2233,10 @@ impl Transaction {
         trace!("release_free_buffers agressive {agressive:?}");
         debug_assert!(self.is_write_tx());
 
-        let mut earliest_tx_needed = self.tracked_transaction.unwrap_or_else(|| self.tx_id() - 1);
+        let mut earliest_tx_needed = self.tx_id();
         // Drop of old Read/Checkpoint transactions is responsible for
         // tail cleanup, we only have to attempt it here if there aren't any.
-        if self.tracked_transaction.is_none() && self.inner.transactions.lock().is_empty() {
+        if !self.is_multi_write_tx() && self.inner.transactions.lock().is_empty() {
             self.release_free_buffers_tail(earliest_tx_needed, agressive);
         }
 
@@ -2296,14 +2297,10 @@ impl Transaction {
         }
     }
 
-    /// The Id of this transaction
+    /// The _original_ Id of this transaction
     ///
-    /// For a read-only transaction, this corresponds to the snapshot being read and reflects a
-    /// write transaction at the time it was committed.
-    ///
-    /// For write transactions this is a new monotonically increasing transaction Id.
-    /// Note that transactions that roll back (or are committed not dirty (see [WriteTransaction::is_dirty])
-    /// are also treated as rollbacks.
+    /// This corresponds to the starting state of the transaction and corresponds to the last
+    /// committed transaction at the time this transaction started.
     pub fn tx_id(&self) -> TxId {
         self.state.get().metapage.tx_id
     }
@@ -2336,7 +2333,8 @@ impl Transaction {
 
     fn check_conflicts(&mut self) -> bool {
         debug_assert!(self.is_multi_write_tx());
-        let base_tx_id = self.tracked_transaction.unwrap();
+        debug_assert_eq!(self.tracked_transaction, Some(self.tx_id()));
+        let base_tx_id = self.tx_id();
         for (&page_id, _) in self.nodes.get_mut().iter() {
             if !self
                 .inner
@@ -2352,6 +2350,7 @@ impl Transaction {
     fn commit_start(&mut self) -> Result<(), Error> {
         debug_assert!(self.is_write_tx());
         let mut check_conflicts = false;
+        let old_tx_id = self.state.get_mut().metapage.tx_id;
         if self.is_multi_write_tx() {
             trace!(
                 "MultiWrite Commit start {}",
@@ -2367,10 +2366,12 @@ impl Transaction {
                 self.state.get_mut().metapage = latest_state.metapage;
                 check_conflicts = true;
             }
-            self.state.get_mut().metapage.tx_id += 1;
         }
-
-        trace!("Commit start {}", self.state.get_mut().metapage.tx_id);
+        self.state.get_mut().metapage.tx_id += 1;
+        trace!(
+            "Commit start {old_tx_id} -> {}",
+            self.state.get_mut().metapage.tx_id
+        );
         self.trap.check()?;
         // Commit the dirty trees but also leave it in a clean state in case we end up caching it later
         let mut tx_trees = mem::take(self.trees.get_mut());
