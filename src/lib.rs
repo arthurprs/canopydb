@@ -1329,9 +1329,7 @@ impl Drop for Transaction {
                 .binary_search_by_key(&tx_id, |ot| ot.tx_id)
                 .expect("missing transaction");
             let ot = &mut transactions[idx];
-            if self.is_multi_write_tx() {
-                ot.writers -= 1;
-            }
+            ot.writers -= self.is_multi_write_tx() as u32;
             ot.ref_count -= 1;
             let removed_tx = ot.ref_count == 0;
             if removed_tx {
@@ -1387,10 +1385,12 @@ impl Drop for Transaction {
 
 impl Transaction {
     fn new_write(inner: &SharedDatabaseInner, user_txn: bool) -> Result<WriteTransaction, Error> {
+        let mut transactions;
         let mut write_lock;
         let mut state;
         loop {
             write_lock = inner.write_lock.write_arc();
+            transactions = inner.transactions.lock();
             state = *inner.state.lock();
             state.check_halted()?;
             if !user_txn || !state.block_user_transactions {
@@ -1398,11 +1398,10 @@ impl Transaction {
             }
             drop(write_lock);
             debug!("new_write waiting for user_transactions to be allowed");
-            // FIXME: this might never get waken
-            inner
-                .transactions_condvar
-                .wait(&mut inner.transactions.lock());
+            inner.transactions_condvar.wait(&mut transactions);
+            drop(transactions);
         }
+        drop(transactions);
         let mut commit_lock = inner.commit_lock.lock_arc();
         state.metapage.tx_id += 1;
         trace!("new_write {}", state.metapage.tx_id);
