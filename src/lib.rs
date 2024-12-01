@@ -130,10 +130,7 @@ bitflags::bitflags! {
 }
 use TransactionFlags as TF;
 
-/// Write transaction
-///
-/// Only one active write transaction can be active at a given time (similar to a Mutex).
-/// This property is automatically enforced by the Database.
+/// # Write transaction
 ///
 /// A Write transaction can mutate data and read its own changes. Any changes must be committed
 /// by calling [WriteTransaction::commit]. Once committed, subsequent transactions will see changes
@@ -147,6 +144,31 @@ use TransactionFlags as TF;
 /// Note that this limit doesn't include previously committed versions from previous
 /// write transactions. Once committed, these changes are considered committed
 /// and count towards the [DbOptions::checkpoint_target_size] and other memory limits.
+///
+/// ## Exclusive Write Transactions
+///
+/// Only one active write transaction can be active at a given time (similar to a Mutex).
+/// This property is automatically enforced by the Database.
+///
+/// Unlike Concurrent Write Transactions, commit cannot error with [`Error::WriteConflict`].
+///
+/// ## Concurrent Write Transactions
+///
+/// Write transactions may run concurrently and conflict detection is performed at commit time.
+/// Applications utilizing this often require wraping write transaction blocks in a loop and retry
+/// the transaction if [`WriteTransaction::commit`] returns [`Error::WriteConflict`].
+///
+/// The implementation detects write-write conflicts at the page level granularity so there could
+/// be "false" conflicts in case mutated keys fall within the same Leaf page. This is equivalent
+/// to Snapshot-Isolation (SI). Note the this isn't _Serializable_-Snapshot-Isolation (SSI) as
+/// Write-Skew can still happen.
+///
+/// While concurrent write transactions have more individual overhead than exclusive write
+/// transactions, they might be useful in cases like:
+///
+/// * Larger than memory workloads where it's useful to load the affected parts of the transaction from the disk in parallel, even if there's a conflict risk.
+/// * Transactions that affect disjoint Trees of the Database and thus can run concurrently without conflicts.
+/// * Random write workloads which have small chances of conflicts and need extra throughput.
 #[derive(Debug, Deref, DerefMut)]
 pub struct WriteTransaction(Transaction);
 
@@ -954,23 +976,23 @@ impl Database {
 
     /// Begins a write transactions
     ///
-    /// If multi is set to true the returned transaction may run concurrently with other
+    /// If `concurrent` is true, the returned transaction may run concurrently with other
     /// multi write transactions. These transactions run under optimistic concurrency control
-    /// and Snapshot-Isolation, see [`WriteTransaction`] for details.
+    /// and Snapshot-Isolation (SI), see [`WriteTransaction`] for details.
     ///
-    /// If multi is false then the transactions runs in exclusive mode with Serializable-Snapshot-Isolation (SSI).
+    /// If `concurrent` is false, then the transactions runs in exclusive mode with Serializable-Snapshot-Isolation (SSI).
     ///  
     /// The returned transaction must be committed for the changes to be persisted.
-    pub fn begin_write_with(&self, multi: bool) -> Result<WriteTransaction, Error> {
+    pub fn begin_write_with(&self, concurrent: bool) -> Result<WriteTransaction, Error> {
         let throttle_spans = self.inner.opts.throttle_memory_limit / PAGE_SIZE as usize;
-        let mut tx = Transaction::new_write(&self.inner, multi, true)?;
+        let mut tx = Transaction::new_write(&self.inner, concurrent, true)?;
         tx.release_free_buffers(tx.inner.page_table.spans_used() >= throttle_spans);
         if tx.inner.page_table.spans_used() >= throttle_spans {
             // drop tx to avoid deadlocking with checkpoints
             drop(tx);
             info!("Throttling write tx");
             thread::sleep(Duration::from_micros(100));
-            tx = Transaction::new_write(&self.inner, multi, true)?;
+            tx = Transaction::new_write(&self.inner, concurrent, true)?;
             while {
                 tx.release_free_buffers(true);
                 tx.inner.page_table.spans_used()
@@ -985,7 +1007,7 @@ impl Database {
                 thread::sleep(Duration::from_micros(100));
                 // Wait for the ongoing checkpoint to finish.
                 self.inner.wait_checkpoint();
-                tx = Transaction::new_write(&self.inner, multi, true)?;
+                tx = Transaction::new_write(&self.inner, concurrent, true)?;
             }
             debug!("Resuming write tx after throttling");
         }
@@ -1258,8 +1280,11 @@ impl WriteTransaction {
     /// Commits the transaction and optionally performs a durable `fsync` to make the transaction
     /// (and all the ones before it) durable in the storage. Returns the new TxId.
     ///
+    /// If this is a concurrent write transaction commit will perform conflict checking and will return
+    /// [`Error::WriteConflict`] in case of conflicts.
+    ///
     /// Note that transactions that aren't dirty (see [WriteTransaction::is_dirty]) are equivalent
-    /// to a rollback (nothing is affected and the result will the be original TxId).
+    /// to a rollback (nothing is affected) and the transaction will return the original TxId.
     pub fn commit_with(mut self, sync: bool) -> Result<TxId, Error> {
         debug_assert!(self.is_write_tx());
         if !self.is_dirty() {
