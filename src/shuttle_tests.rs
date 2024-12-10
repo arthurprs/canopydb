@@ -43,7 +43,6 @@ fn insert_works() {
 }
 
 fn insert_works_stub() {
-    let mut rng = shuttle::rand::thread_rng();
     let temp_dir = tempfile::tempdir().unwrap();
     let mut env_opts = EnvOptions::new(temp_dir.path());
     env_opts.use_mmap = false;
@@ -106,7 +105,9 @@ fn insert_works_stub() {
                         && !stop_.load(atomic::Ordering::SeqCst)
                     {
                         shuttle::thread::yield_now();
-                        rxs.push(db_.begin_read().unwrap());
+                        if thread_rng.gen_bool(1.0 / rxs.len().max(1) as f64) {
+                            rxs.push(db_.begin_read().unwrap());
+                        }
                     }
                     warn!("{cond_name}?");
                     while (db_.inner.page_table.spans_used() * PAGE_SIZE as usize) >= limit
@@ -135,62 +136,64 @@ fn insert_works_stub() {
         threads.push(thread);
     }
 
-    let mut master_sample = HashMap::default();
+    let mut writers = Vec::new();
+    for w in 0..3 {
+        let db = db.clone();
+        let thread = shuttle::thread::spawn(move || {
+            let mut rng = shuttle::rand::thread_rng();
+            let mut master_sample = HashMap::default();
+            for _round_no in 0..3_000 {
+                if _round_no % 1_000 == 0 {
+                    eprintln!("[{w}] Round {_round_no}");
+                }
+                // 1% chance of making a huge txn that spills to disk
+                let extra_samples = if rng.gen_bool(0.01) { 150 } else { 0 };
+                let sample: Vec<_> = (0..5 + extra_samples)
+                    .map(|_| {
+                        let a = rand_str(&mut rng, 3, 200);
+                        let b = rand_str(&mut rng, 3, 4_000);
+                        (a, b)
+                    })
+                    .collect();
 
-    for _round_no in 0..10_000 {
-        if _round_no % 1_000 == 0 {
-            eprintln!("Round {_round_no}");
-        }
-        // 1% chance of making a huge txn that spills to disk
-        let extra_samples = if rng.gen_bool(0.01) { 150 } else { 0 };
-        let sample: Vec<_> = (0..5 + extra_samples)
-            .map(|_| {
-                let a = rand_str(&mut rng, 3, 200);
-                let b = rand_str(&mut rng, 3, 4_000);
-                (a, b)
-            })
-            .collect();
+                let tx = db.begin_write_with(rng.gen_bool(0.66)).unwrap();
+                shuttle::thread::yield_now();
+                let mut tree = tx.get_or_create_tree(b"default").unwrap();
 
-        let tx = db.begin_write().unwrap();
-        let mut tree = tx.get_or_create_tree(b"default").unwrap();
+                shuttle::thread::yield_now();
+                for (k, v) in &sample {
+                    shuttle::thread::yield_now();
+                    tree.insert(k.as_bytes(), v.as_bytes()).unwrap();
+                }
+                drop(tree);
+                shuttle::thread::yield_now();
+                if rng.gen_bool(0.1) {
+                    tx.rollback().unwrap();
+                } else {
+                    match tx.commit() {
+                        Ok(x) => master_sample.extend(sample.into_iter().map(|(k, v)| (k, (x, v)))),
+                        Err(Error::WriteConflict) => (),
+                        Err(e) => std::panic!("{e}"),
+                    }
+                }
 
-        shuttle::thread::yield_now();
-        for (k, v) in &sample {
-            tree.insert(k.as_bytes(), v.as_bytes()).unwrap();
-        }
-        drop(tree);
-        shuttle::thread::yield_now();
-        if rng.gen_bool(0.1) {
-            tx.rollback().unwrap();
-        } else {
-            tx.commit().unwrap();
-            master_sample.extend(sample.into_iter());
-        }
-
-        shuttle::thread::yield_now();
+                shuttle::thread::yield_now();
+            }
+            master_sample
+        });
+        writers.push(thread);
     }
 
-    let mut master_sample = master_sample.into_iter().collect::<Vec<_>>();
-    master_sample.sort_unstable();
-    master_sample.shuffle(&mut rng);
-    let mut iter = master_sample.iter_mut();
-    for _round_no in 0..100 {
-        if _round_no % 20 == 0 {
-            eprintln!("Round {_round_no}");
-        }
-        let sample: Vec<_> = iter.by_ref().take(5).collect();
-        if sample.is_empty() {
-            break;
-        }
-        let tx = db.begin_write().unwrap();
-        let mut tree = tx.get_or_create_tree(b"default").unwrap();
+    let mut master_sample = HashMap::<Vec<u8>, (TxId, Vec<u8>)>::default();
+    for (w, t) in writers.into_iter().enumerate() {
+        let sample = t.join().unwrap();
+        eprintln!("writer {w} finished");
         for (k, v) in sample {
-            *v = rand_str(&mut rng, 3, 600);
-            // println!("inserting {:?}", k.as_bytes());
-            tree.insert(k.as_bytes(), v.as_bytes()).unwrap();
+            let entry = master_sample.entry(k).or_default();
+            if &v > entry {
+                *entry = v;
+            }
         }
-        drop(tree);
-        tx.commit().unwrap();
     }
 
     db.checkpoint().unwrap();
@@ -200,7 +203,7 @@ fn insert_works_stub() {
         eprintln!("validating");
         let rx = db.begin_read().unwrap();
         let tree = rx.get_tree(b"default").unwrap().unwrap();
-        for (k, v) in master_sample.iter() {
+        for (k, (_, v)) in master_sample.iter() {
             let from_db = tree.get(k.as_bytes()).unwrap();
             assert_eq!(from_db.as_deref(), Some(v.as_bytes()));
         }
