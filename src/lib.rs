@@ -1077,10 +1077,6 @@ impl Database {
         }
         let mut transactions = self.inner.transactions.lock();
         self.inner.state.lock().block_user_transactions = true;
-        let _reset_compacting = FnTrap::new(|| {
-            self.inner.state.lock().block_user_transactions = false;
-            self.inner.transactions_condvar.notify_all();
-        });
         while !transactions.is_empty() {
             info!("Compaction waiting for read transactions to finish...");
             self.inner.transactions_condvar.wait(&mut transactions);
@@ -1091,6 +1087,12 @@ impl Database {
         drop(checkpoint_lock);
         drop(transactions);
         drop(write_lock);
+
+        let _reset_compacting = FnTrap::new(|| {
+            let _transactions = self.inner.transactions.lock();
+            self.inner.state.lock().block_user_transactions = false;
+            self.inner.transactions_condvar.notify_all();
+        });
 
         info!(
             "Compaction preparing database {}, initial size {}",
@@ -1432,6 +1434,7 @@ impl Transaction {
         let mut multi_write_lock = None;
         let mut transactions;
         let mut state;
+        let mut waited = false;
         loop {
             if multi {
                 multi_write_lock = Some(inner.write_lock.read_arc());
@@ -1442,11 +1445,15 @@ impl Transaction {
             state = *inner.state.lock();
             state.check_halted()?;
             if !user_txn || !state.block_user_transactions {
+                if waited {
+                    debug!("new_write resuming after user_transactions are allowed");
+                }
                 break;
             }
             exclusive_write_lock = None;
             multi_write_lock = None;
             debug!("new_write waiting for user_transactions to be allowed");
+            waited = true;
             inner.transactions_condvar.wait(&mut transactions);
             drop(transactions);
         }
@@ -1520,12 +1527,17 @@ impl Transaction {
         // * for this state acquisition to not notice the state.block_user_transactions which is updated
         // while holding all locks (inc. transactions).
         let mut transactions = inner.transactions.lock();
+        let mut waited = false;
         loop {
             state = *inner.state.lock();
             if !user_txn || !state.block_user_transactions {
+                if waited {
+                    debug!("new_write resuming after user_transactions are allowed");
+                }
                 break;
             }
             debug!("new_read waiting for user_transactions to be allowed");
+            waited = true;
             inner.transactions_condvar.wait(&mut transactions);
         }
         match transactions.last_mut() {
