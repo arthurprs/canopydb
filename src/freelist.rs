@@ -55,11 +55,10 @@ impl DeferredFreelist {
     }
 
     pub fn append(&mut self, other: Freelist) -> Result<(), Error> {
-        // if !other.is_empty() {
-        //     self.deferred.push(other);
-        // }
-        // Ok(())
-        self.freelist.merge(&other)
+        if !other.is_empty() {
+            self.deferred.push(other);
+        }
+        Ok(())
     }
 
     pub fn into_merged(mut self) -> Result<Freelist, Error> {
