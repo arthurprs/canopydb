@@ -794,6 +794,10 @@ impl Database {
         }
 
         let mut main_allocator = self.inner.allocator.lock();
+        for (_, free, ind_free) in &main_allocator.pending_free {
+            spans.merge(free).unwrap();
+            indirections.merge(ind_free).unwrap();
+        }
         spans.merge(main_allocator.free.merged().unwrap()).unwrap();
         let (snapshots_free_left, snapshots_free_right) = main_allocator
             .snapshot_free
@@ -2236,6 +2240,20 @@ impl Transaction {
     /// Releases all buffers from transactions <= earliest_tx
     fn release_free_buffers_tail(&self, earliest_tx: TxId, can_block: bool) {
         trace!("release_free_buffers_tail earliest_tx {earliest_tx} can_block {can_block:?}");
+        {
+            let mut main = self.inner.allocator.lock();
+            let main = &mut *main;
+            let to_drain_count = main
+                .pending_free
+                .iter()
+                .take_while(|(t, ..)| *t <= earliest_tx)
+                .count();
+            for (_, free, ind_free) in main.pending_free.drain(..to_drain_count) {
+                main.free.append(free);
+                main.indirection_free.append(ind_free);
+            }
+        }
+
         let mut released = SmallVec::<_, 3>::new();
         {
             let mut free_buffers = if can_block {
@@ -2536,6 +2554,7 @@ impl Transaction {
         // Any failures after setting DONE are fatal
         self.flags.get_mut().insert(TF::DONE);
         {
+            let tx_id = self.tx_id();
             let is_multi_write_tx = self.is_multi_write_tx();
             let allocator = self.allocator.get_mut();
             if is_multi_write_tx {
@@ -2543,11 +2562,16 @@ impl Transaction {
                 let mut new_free = allocator.free.clone();
                 new_free.subtract(&allocator.all_allocations);
                 allocator.free.subtract(&new_free);
-                allocator.snapshot_free.merge(&new_free).unwrap();
-                new_free = allocator.indirection_free.clone();
-                new_free.subtract(&allocator.all_allocations);
-                allocator.indirection_free.subtract(&new_free);
-                allocator.snapshot_free.merge(&new_free).unwrap();
+                let mut new_ind_free = allocator.indirection_free.clone();
+                new_ind_free.subtract(&allocator.all_allocations);
+                allocator.indirection_free.subtract(&new_ind_free);
+                if !new_free.is_empty() || !new_ind_free.is_empty() {
+                    self.inner
+                        .allocator
+                        .lock()
+                        .pending_free
+                        .push((tx_id, new_free, new_ind_free));
+                }
             }
             if let Err(e) = allocator.commit() {
                 error!("Commiting allocator error: {e}");

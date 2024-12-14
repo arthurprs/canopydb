@@ -9,7 +9,7 @@ use crate::{
     freelist::Freelist,
     repr::{PageId, FIRST_COMPRESSED_PAGE},
     shim::parking_lot::Mutex,
-    DatabaseInner, DeferredFreelist, FreePage,
+    DatabaseInner, DeferredFreelist, FreePage, TxId,
 };
 
 use triomphe::Arc;
@@ -17,6 +17,8 @@ use zerocopy::AsBytes;
 
 #[derive(Debug, Default)]
 pub(crate) struct MainAllocator {
+    /// Freelists pending a multi-writer tx to clear
+    pub pending_free: Vec<(TxId, Freelist, Freelist)>,
     /// Free Page Ids
     pub free: DeferredFreelist,
     /// Free Indirection Page Ids
@@ -299,16 +301,16 @@ impl Allocator {
 
     pub fn commit(&mut self) -> Result<(), Error> {
         let mut main = self.main.as_ref().unwrap().lock();
-        main.free.append(mem::take(&mut self.free))?;
+        main.free.append(mem::take(&mut self.free));
         main.snapshot_free
-            .append(mem::take(&mut self.snapshot_free))?;
+            .append(mem::take(&mut self.snapshot_free));
         main.next_snapshot_free
-            .append(mem::take(&mut self.next_snapshot_free))?;
+            .append(mem::take(&mut self.next_snapshot_free));
         if !self.is_checkpointer {
             // indirection_free from the ckp allocator is a copy
             // of main allocator indirection_free when it was created.
             main.indirection_free
-                .append(mem::take(&mut self.indirection_free))?;
+                .append(mem::take(&mut self.indirection_free));
         } else {
             // force free to be merged, as we could be returning a large number of pages
             main.free.merged()?;
@@ -319,8 +321,8 @@ impl Allocator {
     pub fn rollback(&mut self) -> Result<(), Error> {
         let mut main = self.main.as_ref().unwrap().lock();
         let indirect_allocations = self.all_allocations.split_off(FIRST_COMPRESSED_PAGE);
-        main.free.append(mem::take(&mut self.all_allocations))?;
-        main.indirection_free.append(indirect_allocations)?;
+        main.free.append(mem::take(&mut self.all_allocations));
+        main.indirection_free.append(indirect_allocations);
         Ok(())
     }
 
