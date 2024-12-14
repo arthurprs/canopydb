@@ -7,6 +7,7 @@ use std::{
 
 use crate::{
     repr::{DbId, TreeId},
+    utils::EscapedBytes,
     EnvOptions, TreeOptions,
 };
 
@@ -41,11 +42,17 @@ mod op_bytes {
 #[derive(Debug)]
 pub enum Operation {
     Database(DbId),
+    #[debug("Insert({_0}, {}, {})", EscapedBytes(&_1), EscapedBytes(&_2))]
     Insert(TreeId, Vec<u8>, Vec<u8>),
+    #[debug("Delete({_0}, {})", EscapedBytes(&_1))]
     Delete(TreeId, Vec<u8>),
+    #[debug("DeleteRange({_0}, ({:?}, {:?}))", _1.0.as_ref().map(|a| EscapedBytes(&a)),  _1.1.as_ref().map(|a| EscapedBytes(&a)))]
     DeleteRange(TreeId, (Bound<Vec<u8>>, Bound<Vec<u8>>)),
+    #[debug("CreateTree({_0}, {}, {_2:?})", EscapedBytes(&_1))]
     CreateTree(TreeId, Vec<u8>, TreeOptions),
+    #[debug("DeleteTree({})", EscapedBytes(&_0))]
     DeleteTree(Vec<u8>),
+    #[debug("RenameTree({}, {})", EscapedBytes(&_0), EscapedBytes(&_1))]
     RenameTree(Vec<u8>, Vec<u8>),
 }
 
