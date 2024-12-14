@@ -573,17 +573,18 @@ impl Actor {
 }
 
 fuzz_target!(|ops: Vec<Op>| {
+    let test_recovery = cfg!(feature = "failpoints") || MAX_WRITERS != 1;
+    let always_validate =
+        std::env::var("ALWAYS_VALIDATE").map_or(0, |s| s.parse::<i64>().unwrap()) != 0;
     let _ = env_logger::builder().format_timestamp(None).try_init();
     let tmp_dir = tempfile::tempdir().unwrap();
     let mut options = canopydb::EnvOptions::new(tmp_dir.as_ref());
     options.wait_bg_threads_on_drop = true;
     let mut db_options = canopydb::DbOptions::default();
     db_options.checkpoint_interval = std::time::Duration::MAX;
-    db_options.use_wal = cfg!(feature = "failpoints");
+    db_options.use_wal = test_recovery;
     db_options.default_commit_sync = false;
     // db_options.checkpoint_target_size = 16 * 4096 as usize;
-    let always_validate =
-        std::env::var("ALWAYS_VALIDATE").map_or(0, |s| s.parse::<i64>().unwrap()) != 0;
     let db = canopydb::Database::with_options(options.clone(), db_options.clone()).unwrap();
     let mut world = World {
         state: WorldState {
@@ -643,7 +644,7 @@ fuzz_target!(|ops: Vec<Op>| {
     }
     assert!(world.actors.iter().all(|a| a.op_queue.is_empty()));
 
-    if !cfg!(feature = "failpoints") {
+    if !test_recovery {
         return;
     }
 
