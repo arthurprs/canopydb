@@ -665,6 +665,8 @@ impl<'tx> Tree<'tx> {
             let mut node_mut = tree.tx.make_dirty(&mut node)?;
             tree.free_value(&node_mut.value_at(idx))?;
             node_mut.remove_key_repr_at(idx);
+        } else if tree.tx.is_multi_write_tx() {
+            tree.tx.make_dirty(&mut node)?;
         }
 
         let (id, num_keys) = (node.id(), node.num_keys());
@@ -1561,12 +1563,12 @@ fn remove_range_node(
         let mut node = node.into_leaf();
         let start_i = search_bound(&node, start, false);
         let end_i = search_bound(&node, end, true);
-        if start_i >= end_i {
+        if !tree.tx.is_multi_write_tx() && start_i >= end_i {
             let id = node.id();
             tree.tx.stash_node(node)?;
             return Ok(MutateResult::Ok(id));
         }
-        tree.inc_num_keys(-((end_i - start_i) as i64));
+        tree.inc_num_keys(-(end_i.saturating_sub(start_i) as i64));
         if start_i == 0 && end_i == node.num_keys() {
             for (ov_id, ov_span) in node.overflow_children() {
                 tree.tx.free_page_with_id(ov_id, ov_span)?;
