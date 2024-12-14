@@ -479,7 +479,7 @@ impl<'tx> Tree<'tx> {
             ));
         }
         if self.value.fixed_value_len >= 0 {
-            if value.map_or(false, |v| v.len() != self.value.fixed_value_len as usize) {
+            if value.is_some_and(|v| v.len() != self.value.fixed_value_len as usize) {
                 return Err(error_validation!(
                     "Tree only accepts values of length {}",
                     self.value.fixed_value_len

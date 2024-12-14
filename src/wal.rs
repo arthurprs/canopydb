@@ -843,7 +843,7 @@ impl Wal {
             if files_to_delete
                 .last()
                 .zip(files.last_key_value())
-                .map_or(false, |((l_d, _), (&l_f, _))| l_d.start == l_f)
+                .is_some_and(|((l_d, _), (&l_f, _))| l_d.start == l_f)
             {
                 let next_idx = files_to_delete.last().unwrap().0.end;
                 let wal_file = self.create_new_file(next_idx)?;

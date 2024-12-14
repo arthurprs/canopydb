@@ -254,7 +254,7 @@ impl PageTable {
     pub fn is_latest_from_lte(&self, tx_id: TxId, page_id: PageId) -> bool {
         trace!("is_latest_from_lte tx_id {tx_id} page {page_id}");
         if let Some(values) = self.table.get(&page_id) {
-            values.last().map_or(true, |&(from, _)| from <= tx_id)
+            values.last().is_none_or(|&(from, _)| from <= tx_id)
         } else {
             true
         }
@@ -318,7 +318,7 @@ impl PageTable {
         let mut drop_list = SmallVec::<InnerItem, 20>::new();
         self.table.retain(|_page_id, values| {
             debug_assert!(values.last().unwrap().0 <= tx_id);
-            if values.last().map_or(false, |(i, _)| i == &tx_id) {
+            if values.last().is_some_and(|(i, _)| i == &tx_id) {
                 let (_, pop) = values.pop().unwrap();
                 drop_list.push(pop);
                 !values.is_empty()

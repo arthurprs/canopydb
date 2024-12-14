@@ -297,7 +297,7 @@ impl DatabaseFile {
             .mmap
             .read()
             .as_ref()
-            .map_or(false, |m| m.len() as u64 >= file_len)
+            .is_some_and(|m| m.len() as u64 >= file_len)
         {
             return Ok(());
         }
@@ -1945,7 +1945,7 @@ impl Transaction {
                 // buffer free handled by checkpointer
                 debug_assert!(r_latest);
                 debug_assert!(page_id.is_compressed());
-                let target = if ongoing_snapshot_tx_id.map_or(false, |ockp| from <= ockp) {
+                let target = if ongoing_snapshot_tx_id.is_some_and(|ockp| from <= ockp) {
                     &mut allocator.next_snapshot_free
                 } else {
                     &mut allocator.snapshot_free
@@ -3264,7 +3264,7 @@ impl DatabaseInner {
             }
             CheckpointReason::WalSize(min_wal_tail) => {
                 let cur_wal_tail = inner.wal_tail();
-                if cur_wal_tail.map_or(true, |w| w > min_wal_tail) {
+                if cur_wal_tail.is_none_or(|w| w > min_wal_tail) {
                     debug!("Ignoring checkpoint request {reason:?}, tail is {cur_wal_tail:?}");
                     return Ok(0);
                 }

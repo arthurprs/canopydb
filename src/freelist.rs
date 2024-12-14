@@ -48,7 +48,7 @@ impl DeferredFreelist {
         bulk_span: PageId,
         precise: bool,
     ) -> Result<Freelist, Error> {
-        if self.deferred.last().map_or(false, |f| f.len() >= min_span) {
+        if self.deferred.last().is_some_and(|f| f.len() >= min_span) {
             return Ok(self.deferred.pop().unwrap());
         }
         Ok(self.merged()?.bulk_allocate(bulk_span, precise))
@@ -569,7 +569,7 @@ impl Shard {
         if self
             .ranges
             .first()
-            .map_or(true, |r| self.base + r.page_end() <= right_gte)
+            .is_none_or(|r| self.base + r.page_end() <= right_gte)
         {
             return other;
         }
@@ -684,7 +684,7 @@ impl Freelist {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.shards.as_ref().map_or(true, |s| s.is_empty())
+        self.shards.as_ref().is_none_or(|s| s.is_empty())
     }
 
     pub fn len(&self) -> PageId {
@@ -987,7 +987,7 @@ impl Freelist {
     fn validate(&self) -> bool {
         self.shards
             .as_ref()
-            .map_or(true, |s| s.iter().all(|s| s.validate() && !s.is_empty()))
+            .is_none_or(|s| s.iter().all(|s| s.validate() && !s.is_empty()))
     }
 }
 
