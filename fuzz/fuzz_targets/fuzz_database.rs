@@ -218,8 +218,23 @@ impl<'a> Arbitrary<'a> for Op {
 type ModelTreeMut = BTreeMap<Bytes, Bytes>;
 type ModelTree = Rc<ModelTreeMut>;
 type ModelTreeRef<'a> = &'a ModelTreeMut;
-const NUM_ACTORS: usize = 2;
-const MAX_WRITERS: usize = 2;
+
+const MAX_WRITERS: usize = if let Some(n) = option_env!("MAX_WRITERS") {
+    match usize::from_str_radix(n, 10) {
+        Ok(n) => n,
+        Err(_) => 1,
+    }
+} else {
+    1
+};
+const NUM_ACTORS: usize = if let Some(n) = option_env!("NUM_ACTORS") {
+    match usize::from_str_radix(n, 10) {
+        Ok(n) => n,
+        Err(_) => MAX_WRITERS,
+    }
+} else {
+    MAX_WRITERS
+};
 
 struct WorldState {
     writers: BTreeSet<ActorId>,
@@ -377,7 +392,7 @@ impl Actor {
         match &mut self.tx {
             Tx::None => {
                 if state.writers.len() < MAX_WRITERS {
-                    match state.db.begin_write() {
+                    match state.db.begin_write_with(MAX_WRITERS > 1) {
                         Ok(tx) => {
                             self.tx = Tx::Write((*state.model).clone(), tx, state.model.clone())
                         }
@@ -584,7 +599,10 @@ fuzz_target!(|ops: Vec<Op>| {
     for (i, a) in world.actors.iter_mut().enumerate() {
         a.id = Uint(i);
     }
-    dbg!(ops.len());
+    eprintln!(
+        "NUM_ACTORS {NUM_ACTORS} MAX_WRITERS {MAX_WRITERS} OPS {}",
+        ops.len()
+    );
     for op in ops {
         let actor_no = op.actor().0;
         world.actors[actor_no].op_queue.push_back(op);
