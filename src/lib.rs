@@ -115,17 +115,17 @@ bitflags::bitflags! {
     #[derive(Default, Copy, Clone)]
     struct TransactionFlags: u8 {
         /// Set if the txn was committed or rolledback
-        const DONE = 0b00000001;
+        const DONE = 1;
         /// Set if the txn altered anything
-        const DIRTY = 0b00000010;
+        const DIRTY = 1 << 1;
         /// Set for all kinds of write transactions
-        const WRITE_TX = 0b00000100;
+        const WRITE_TX = 1 << 2;
         /// Set for multi write transactions
-        const MULTI_WRITE_TX = 0b00001000;
-        /// Set when the page table is dirty and may need cleanup on rollback
-        const PAGE_TABLE_DIRTY = 0b00010000;
+        const MULTI_WRITE_TX = 1 << 3;
         /// Set for checkpoint transactions
-        const CHECKPOINT_TX = 0b00001000;
+        const CHECKPOINT_TX = 1 << 4;
+        /// Set when the page table is dirty and may need cleanup on rollback
+        const PAGE_TABLE_DIRTY = 1 << 5;
     }
 }
 use TransactionFlags as TF;
@@ -565,7 +565,7 @@ impl DatabaseRecovery {
         let mut ops = 0;
         for op in operations {
             let op = op?;
-            // trace!("Replaying op {:?}", op);
+            trace!("Replaying op {:?}", op);
             match op {
                 wb::Operation::Database(_) => (),
                 wb::Operation::Insert(tree_id, key, value) => {
@@ -938,7 +938,7 @@ impl Database {
             debug!("Parsing freelist from {}", ByteSize(fl_data.len() as u64));
             *allocator = MainAllocator::from_bytes(&fl_data)
                 .map_err(|e| io_invalid_data!("Error parsing freelist: {e}"))?;
-            let expected_file_size = dbg!(allocator.next_page_id) as u64 * PAGE_SIZE;
+            let expected_file_size = allocator.next_page_id as u64 * PAGE_SIZE;
             let file_len = self.inner.file.file_len();
             match file_len.cmp(&expected_file_size) {
                 Ordering::Equal => (),
