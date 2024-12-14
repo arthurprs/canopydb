@@ -1387,6 +1387,9 @@ impl Drop for Transaction {
                     .try_lock()
                     .map(|state| state.metapage.tx_id)
             });
+            if earliest_open_read_tx.is_none() {
+                self.inner.transactions_condvar.notify_all();
+            }
             drop(transactions);
 
             match earliest_tx_needed {
@@ -1399,9 +1402,6 @@ impl Drop for Transaction {
                     free_buffers.scan_from = free_buffers.scan_from.min(tx_id);
                 }
                 _ => (),
-            }
-            if earliest_open_read_tx.is_none() {
-                self.inner.transactions_condvar.notify_all();
             }
         }
 
