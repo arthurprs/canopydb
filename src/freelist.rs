@@ -600,6 +600,57 @@ impl Shard {
         ranges.drain(0..full_moves);
         other
     }
+
+    fn subtract(&mut self, other_shard: &Self) {
+        if other_shard.ranges.len() < self.ranges.len() {
+            for (page_id, span) in other_shard.iter_spans() {
+                self.remove(page_id, span);
+            }
+            return;
+        }
+        self.len = 0;
+        self.hist.0.fill(0);
+        let ranges = Arc::make_mut(&mut self.ranges);
+        let this_ranges = mem::take(ranges)
+            .into_iter()
+            .map(|r| r.page()..r.page_end());
+        let mut other_ranges = other_shard
+            .ranges
+            .iter()
+            .map(|r| r.page()..r.page_end())
+            .peekable();
+        let mut push_non_empty = |r: std::ops::Range<PageId>| {
+            let range = Range {
+                page: r.start as u16,
+                zspan: (r.len() - 1) as u16,
+            };
+            self.hist.inc(range.zspan, 1);
+            self.len += range.span();
+            ranges.push(range);
+        };
+        for mut r in this_ranges {
+            loop {
+                if let Some(d) = other_ranges.peek() {
+                    if d.start >= r.end {
+                        other_ranges.next();
+                        continue;
+                    }
+                    let intersect = r.start.max(d.start)..r.end.min(d.end);
+                    let hi = intersect.end.max(r.start)..r.end;
+                    r = r.start..intersect.start.min(r.end);
+                    if !hi.is_empty() {
+                        push_non_empty(hi);
+                    }
+                    if r.is_empty() {
+                        break;
+                    }
+                } else {
+                    push_non_empty(r);
+                    break;
+                }
+            }
+        }
+    }
 }
 
 impl Freelist {
@@ -971,9 +1022,7 @@ impl Freelist {
             };
             let shards = Arc::make_mut(shards);
             let shard = &mut shards[shard_pos];
-            for (page_id, span) in other_shard.iter_spans() {
-                shard.remove(page_id, span);
-            }
+            shard.subtract(other_shard);
             if shard.is_empty() {
                 shards.remove(shard_pos);
             }
@@ -1316,8 +1365,8 @@ mod proptests {
 
         #[test]
         fn subtract(
-            mut this in prop::collection::btree_set(60_000u32..70_000, 0..5_000),
-            that in prop::collection::btree_set(60_000u32..70_000, 0..5_000)
+            mut this in prop::collection::btree_set(60_000u32..70_000, 0..10_000),
+            that in prop::collection::btree_set(60_000u32..70_000, 0..10_000)
         ) {
             let mut a = Freelist::from_set(&this);
             let b = Freelist::from_set(&that);
