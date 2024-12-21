@@ -610,7 +610,7 @@ impl Shard {
         }
         self.len = 0;
         self.hist.0.fill(0);
-        let ranges = Arc::make_mut(&mut self.ranges);
+        let ranges = range_vec_make_mut(&mut self.ranges, 0);
         let this_ranges = mem::take(ranges)
             .into_iter()
             .map(|r| r.page()..r.page_end());
