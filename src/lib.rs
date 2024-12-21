@@ -990,7 +990,7 @@ impl Database {
     pub fn begin_write_with(&self, concurrent: bool) -> Result<WriteTransaction, Error> {
         let throttle_spans = self.inner.opts.throttle_memory_limit / PAGE_SIZE as usize;
         let mut tx = Transaction::new_write(&self.inner, concurrent, true)?;
-        tx.release_free_buffers(tx.inner.page_table.spans_used() >= throttle_spans);
+        tx.release_versions(tx.inner.page_table.spans_used() >= throttle_spans);
         if tx.inner.page_table.spans_used() >= throttle_spans {
             // drop tx to avoid deadlocking with checkpoints
             drop(tx);
@@ -998,7 +998,7 @@ impl Database {
             thread::sleep(Duration::from_micros(100));
             tx = Transaction::new_write(&self.inner, concurrent, true)?;
             while {
-                tx.release_free_buffers(true);
+                tx.release_versions(true);
                 tx.inner.page_table.spans_used()
                     >= tx.inner.opts.stall_memory_limit / PAGE_SIZE as usize
             } {
@@ -1398,8 +1398,8 @@ impl Drop for Transaction {
 
             match earliest_tx_needed {
                 Some(earliest) if earliest > tx_id => {
-                    trace!("Calling release_free_buffers_tail from read tx {tx_id} drop, earliest tx needed {earliest}");
-                    self.release_free_buffers_tail(earliest, false);
+                    trace!("Calling release_versions_tail from tx {tx_id} drop, earliest tx needed {earliest}");
+                    self.release_versions_tail(earliest, false);
                 }
                 _ if removed_tx => {
                     let mut free_buffers = self.inner.free_buffers.lock();
@@ -2237,9 +2237,9 @@ impl Transaction {
         Ok(())
     }
 
-    /// Releases all buffers from transactions <= earliest_tx
-    fn release_free_buffers_tail(&self, earliest_tx: TxId, can_block: bool) {
-        trace!("release_free_buffers_tail earliest_tx {earliest_tx} can_block {can_block:?}");
+    /// Releases all buffers and pending free pages from transactions <= earliest_tx
+    fn release_versions_tail(&self, earliest_tx: TxId, can_block: bool) {
+        trace!("release_versions_tail earliest_tx {earliest_tx} can_block {can_block:?}");
         {
             let mut main = self.inner.allocator.lock();
             let main = &mut *main;
@@ -2282,15 +2282,15 @@ impl Transaction {
         }
     }
 
-    fn release_free_buffers(&self, agressive: bool) {
-        trace!("release_free_buffers agressive {agressive:?}");
+    fn release_versions(&self, agressive: bool) {
+        trace!("release_versions agressive {agressive:?}");
         debug_assert!(self.is_write_tx());
 
         let mut earliest_tx_needed = self.tx_id();
         // Drop of old Read/Checkpoint transactions is responsible for
         // tail cleanup, we only have to attempt it here if there aren't any.
         if !self.is_multi_write_tx() && self.inner.transactions.lock().is_empty() {
-            self.release_free_buffers_tail(earliest_tx_needed, agressive);
+            self.release_versions_tail(earliest_tx_needed, agressive);
         }
 
         if !agressive {
@@ -2558,7 +2558,6 @@ impl Transaction {
             let is_multi_write_tx = self.is_multi_write_tx();
             let allocator = self.allocator.get_mut();
             if is_multi_write_tx {
-                // FIXME: move to pending free instead?
                 let mut new_free = allocator.free.clone();
                 new_free.subtract(&allocator.all_allocations);
                 allocator.free.subtract(&new_free);
@@ -2617,7 +2616,7 @@ impl Transaction {
         } else if self.inner.page_table.spans_used()
             >= self.inner.opts.checkpoint_target_size / PAGE_SIZE as usize
         {
-            self.release_free_buffers(true);
+            self.release_versions(true);
             let spans_used = self.inner.page_table.spans_used();
             if spans_used >= self.inner.opts.checkpoint_target_size / PAGE_SIZE as usize
                 && self.inner.checkpoint_queue.is_empty()
