@@ -15,7 +15,7 @@ Embedded Key-Value Storage Engine
 * Efficient async durability with background WAL fsyncs (e.g. every 500ms)
 * Bounded recovery times using an optional Write-Ahead-Log (WAL)
 * Concurrent write transactions with optimistic concurrency control
-* ACID transactions with serializable snapshot isolation (SSI) or snapshot isolation (SSI)
+* ACID transactions with serializable snapshot isolation (SSI) or snapshot isolation (SI)
 * Multi-Version-Concurrency-Control (MVCC) - writers do not block readers and vice versa
 * Long running read transactions have limited impact on the database
 * Supports larger than memory transactions

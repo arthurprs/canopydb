@@ -161,13 +161,14 @@ use TransactionFlags as TF;
 /// The implementation detects write-write conflicts at the page level granularity so there could
 /// be "false" conflicts in case mutated keys fall within the same Leaf page. This is equivalent
 /// to Snapshot-Isolation (SI). Note the this isn't _Serializable_-Snapshot-Isolation (SSI) as
-/// Write-Skew can still happen.
+/// Write-Skew anomalies can still happen.
 ///
 /// While concurrent write transactions have more individual overhead than exclusive write
 /// transactions, they might be useful in cases like:
 ///
-/// * Larger than memory workloads where it's useful to load the affected parts of the transaction from the disk in parallel, even if there's a conflict risk.
+/// * Transactions that run significant amounts of non-database code between database operations and have low conflict chance.
 /// * Transactions that affect disjoint Trees of the Database and thus can run concurrently without conflicts.
+/// * Larger than memory workloads, as it's useful to load relevant parts of the transaction from the disk concurrently, even if there's a conflict risk.
 /// * Random write workloads which have small chances of conflicts and need extra throughput.
 #[derive(Debug, Deref, DerefMut)]
 pub struct WriteTransaction(Transaction);
@@ -970,21 +971,29 @@ impl Database {
         self.inner.env.wal.sync()
     }
 
-    /// Begins an Exclusive Write transaction. Equivalent to `begin_write_with(false)`
-    ///
-    /// The returned transaction must be committed for the changes to be persisted.
+    /// Begins an Exclusive Write transaction. Equivalent to `begin_write_with(false)`.
     #[inline]
     pub fn begin_write(&self) -> Result<WriteTransaction, Error> {
         self.begin_write_with(false)
     }
 
+    /// Begins a Concurrent Write transaction. Equivalent to `begin_write_with(true)`.
+    ///
+    /// See [`WriteTransaction`] for recommendations.
+    #[inline]
+    pub fn begin_write_concurrent(&self) -> Result<WriteTransaction, Error> {
+        self.begin_write_with(true)
+    }
+
     /// Begins a write transactions
     ///
     /// If `concurrent` is true, the returned transaction may run concurrently with other
-    /// multi write transactions. These transactions run under optimistic concurrency control
+    /// _concurrent_ multi write transactions. These transactions run under optimistic concurrency control
     /// and Snapshot-Isolation (SI), see [`WriteTransaction`] for details.
     ///
     /// If `concurrent` is false, then the transactions runs in exclusive mode with Serializable-Snapshot-Isolation (SSI).
+    ///
+    /// Both concurrent modes can be mixed safely. See [`WriteTransaction`] for recommendations.
     ///  
     /// The returned transaction must be committed for the changes to be persisted.
     pub fn begin_write_with(&self, concurrent: bool) -> Result<WriteTransaction, Error> {
