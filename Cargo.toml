@@ -36,7 +36,8 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 memmap2 = "0.9"
 parking_lot = { version = "0.12", features = ["send_guard"] }
 rand = { version = "0.8" }
-xxhash-rust = { version = "0.8.12", features = ["xxh3"] }
+# pinned until https://github.com/DoumanAsh/xxhash-rust/issues/50 is resolved
+xxhash-rust = { version = "=0.8.12", features = ["xxh3"] }
 zerocopy = { version = "0.7", default-features = false, features = ["derive"] }
 shuttle = { version = "0.7", optional = true }
 hashbrown = "0.14.5"
