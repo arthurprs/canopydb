@@ -1161,9 +1161,8 @@ impl Database {
         let mut metapage = self.inner.state.lock().metapage;
         if metapage.tx_id <= metapage.snapshot_tx_id {
             let tx = Transaction::new_write(&self.inner, false, false)?;
-            metapage.tx_id = tx.tx_id();
             tx.mark_dirty();
-            tx.commit()?;
+            metapage.tx_id = tx.commit()?;
         }
         self.checkpoint_internal(Some(metapage.tx_id))
     }
@@ -1339,6 +1338,17 @@ impl WriteTransaction {
             free_space = main_allocator.free.merged()?.clone();
             free_space.merge(&self.0.allocator.get_mut().free)?;
         }
+        debug!(
+            "Total freespace available {:?}",
+            ByteSize(free_space.len() as u64 * PAGE_SIZE)
+        );
+        for (st, fl) in self.inner.old_snapshots.lock().iter() {
+            debug!(
+                "Snapshot {st} space available {:?}",
+                ByteSize(fl.len() as u64 * PAGE_SIZE)
+            );
+        }
+        debug_assert!(self.inner.allocator.lock().pending_free.is_empty());
         // figure out the amount of data that is moveable using binary search
         let mut lo = 0;
         let mut hi = end_of_file;
@@ -1511,7 +1521,8 @@ impl Transaction {
             "new_write {} multi {multi:?} user {user_txn:?}",
             state.metapage.tx_id
         );
-        let allocator = Allocator::new_transaction(inner)?;
+        let allocator =
+            Allocator::new_transaction(inner, !multi && state.ongoing_snapshot_tx_id.is_none())?;
         Ok(WriteTransaction(Transaction {
             flags: Cell::new(flags),
             trap: Default::default(),

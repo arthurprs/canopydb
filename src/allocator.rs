@@ -129,7 +129,7 @@ impl Allocator {
     const INITIAL_ALLOC: PageId = 100;
     const ALLOCATION_BATCH: PageId = 100;
 
-    pub fn new_transaction(inner: &DatabaseInner) -> Result<Allocator, Error> {
+    pub fn new_transaction(inner: &DatabaseInner, exclusive: bool) -> Result<Allocator, Error> {
         let mut result = Self {
             is_checkpointer: false,
             main: Some(inner.allocator.clone()),
@@ -138,9 +138,12 @@ impl Allocator {
         let mut main = inner.allocator.lock();
         result.main_next_page_id = main.next_page_id;
         result.main_next_indirection_id = main.next_indirection_id;
-        result.free =
+        result.free = if exclusive {
+            mem::take(main.free.merged()?)
+        } else {
             main.free
-                .bulk_allocate(Self::INITIAL_ALLOC_MIN, Self::INITIAL_ALLOC, true)?;
+                .bulk_allocate(Self::INITIAL_ALLOC_MIN, Self::INITIAL_ALLOC, true)?
+        };
         drop(main);
         result.all_allocations.merge(&result.free)?;
         Ok(result)
