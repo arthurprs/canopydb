@@ -538,16 +538,16 @@ impl Actor {
                     "key {:?}",
                     EscapedBytes(k.as_ref())
                 );
-                // let mut range = tree.range(k..=k).unwrap();
-                // let (k1, v1) = range.next().unwrap().unwrap();
-                // assert_eq!(EscapedBytes(k), EscapedBytes(k1.as_ref()));
-                // assert_eq!(
-                //     EscapedBytes(mv),
-                //     EscapedBytes(v1.as_ref()),
-                //     "key {:?}",
-                //     EscapedBytes(k.as_ref())
-                // );
-                // assert!(range.next().is_none());
+                let mut range = tree.range(k..=k).unwrap();
+                let (k1, v1) = range.next().unwrap().unwrap();
+                assert_eq!(EscapedBytes(k), EscapedBytes(k1.as_ref()));
+                assert_eq!(
+                    EscapedBytes(mv),
+                    EscapedBytes(v1.as_ref()),
+                    "key {:?}",
+                    EscapedBytes(k.as_ref())
+                );
+                assert!(range.next().is_none());
             }
             assert_eq!(tree.len() as usize, model.len());
         }
@@ -584,7 +584,7 @@ fuzz_target!(|ops: Vec<Op>| {
     db_options.checkpoint_interval = std::time::Duration::MAX;
     db_options.use_wal = test_recovery;
     db_options.default_commit_sync = false;
-    // db_options.checkpoint_target_size = 16 * 4096 as usize;
+    db_options.checkpoint_target_size = 16 * 4096 as usize;
     let db = canopydb::Database::with_options(options.clone(), db_options.clone()).unwrap();
     let mut world = World {
         state: WorldState {

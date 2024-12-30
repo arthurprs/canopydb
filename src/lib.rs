@@ -158,10 +158,11 @@ use TransactionFlags as TF;
 /// Applications utilizing this often require wraping write transaction blocks in a loop and retry
 /// the transaction if [`WriteTransaction::commit`] returns [`Error::WriteConflict`].
 ///
-/// The implementation detects write-write conflicts at the page level granularity so there could
-/// be "false" conflicts in case mutated keys fall within the same Leaf page. This is equivalent
-/// to Snapshot-Isolation (SI). Note the this isn't _Serializable_-Snapshot-Isolation (SSI) as
+/// These transactions provide Snapshot-Isolation (SI) instead of _Serializable_-Snapshot-Isolation (SSI) as
 /// Write-Skew anomalies can still happen.
+///
+/// Note that the implementation detects write-write conflicts at the page level granularity so there could
+/// be "false" conflicts in case mutated keys fall within the same Leaf page.
 ///
 /// While concurrent write transactions have more individual overhead than exclusive write
 /// transactions, they might be useful in cases like:

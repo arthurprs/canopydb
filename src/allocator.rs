@@ -138,12 +138,13 @@ impl Allocator {
         let mut main = inner.allocator.lock();
         result.main_next_page_id = main.next_page_id;
         result.main_next_indirection_id = main.next_indirection_id;
-        result.free = if exclusive {
-            mem::take(main.free.merged()?)
+        if exclusive {
+            mem::swap(&mut result.free, main.free.merged()?);
         } else {
-            main.free
-                .bulk_allocate(Self::INITIAL_ALLOC_MIN, Self::INITIAL_ALLOC, true)?
-        };
+            result.free =
+                main.free
+                    .bulk_allocate(Self::INITIAL_ALLOC_MIN, Self::INITIAL_ALLOC, true)?
+        }
         drop(main);
         result.all_allocations.merge(&result.free)?;
         Ok(result)
@@ -310,13 +311,13 @@ impl Allocator {
         main.next_snapshot_free
             .append(mem::take(&mut self.next_snapshot_free));
         if !self.is_checkpointer {
-            // indirection_free from the ckp allocator is a copy
-            // of main allocator indirection_free when it was created.
             main.indirection_free
                 .append(mem::take(&mut self.indirection_free));
         } else {
             // force free to be merged, as we could be returning a large number of pages
             main.free.merged()?;
+            // indirection_free from the ckp allocator is a copy
+            // of main allocator indirection_free when it was created.
         }
         Ok(())
     }
