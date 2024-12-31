@@ -30,15 +30,13 @@ The storage engine is optimized for read heavy and read-modify-write workloads w
 Basic usage
 
 ```rust
-use canopydb::Database;
-
 let sample_data: [(&[u8], &[u8]); 3] = [
     (b"baz", b"qux"),
     (b"foo", b"bar"),
     (b"qux", b"quux"),
 ];
 let _dir = tempfile::tempdir().unwrap();
-let db = Database::new(_dir.path()).unwrap();
+let db = canopydb::Database::new(_dir.path()).unwrap();
 let tx = db.begin_write().unwrap();
 {
     // multiple trees (keyspaces) per database, fully transactional
@@ -72,21 +70,65 @@ for kv_pair_result in tree.iter().unwrap() {
 }
 ```
 
+Concurrent write transactions
+
+```rust
+const THREADS: usize = 4;
+const INC_PER_THREAD: usize = 5_000;
+let _dir = tempfile::tempdir().unwrap();
+let db = canopydb::Database::new(_dir.path()).unwrap();
+
+std::thread::scope(|scope| {
+    for _thread in 0..THREADS {
+        scope.spawn(|| {
+            let mut successes = 0;
+            while successes < INC_PER_THREAD {
+                // This write txn will run concurrently with other concurrent transactions.
+                // But they may conflict at commit time.
+                let tx = db.begin_write_concurrent().unwrap();
+                let mut tree = tx.get_or_create_tree(b"tree").unwrap();
+                // Each thread will independently increment a counter INC_PER_THREAD times
+                let prev = if let Some(value) = tree.get(b"key").unwrap() {
+                    usize::from_ne_bytes(value.as_ref().try_into().unwrap())
+                } else {
+                    0
+                };
+                tree.insert(b"key", &(prev + 1).to_ne_bytes()).unwrap();
+                drop(tree);
+                match tx.commit() {
+                    Ok(_tx_id) => {
+                        successes += 1;
+                    }
+                    Err(canopydb::Error::WriteConflict) => {
+                        // Conflict, retry...
+                    }
+                    Err(e) => panic!("Commit error: {e}"),
+                }
+            }
+        });
+    }
+});
+let rx = db.begin_read().unwrap();
+let tree = rx.get_tree(b"tree").unwrap().unwrap();
+let value = tree.get(b"key").unwrap().unwrap();
+let value_usize = usize::from_ne_bytes(value.as_ref().try_into().unwrap());
+println!("Final value: {value_usize}");
+assert_eq!(THREADS * INC_PER_THREAD, value_usize);
+```
+
 Multiple databases per environment
 
 ```rust
-use canopydb::{EnvOptions, Environment};
-
 let sample_data = [
     (&b"baz"[..], &b"qux"[..]),
     (&b"foo"[..], &b"bar"[..]),
     (&b"qux"[..], &b"quux"[..]),
 ];
 let _dir = tempfile::tempdir().unwrap();
-let mut options = EnvOptions::new(_dir.path());
+let mut options = canopydb::EnvOptions::new(_dir.path());
 // all databases in the same environment will share this 1GB cache
 options.page_cache_size = 1024 * 1024 * 1024;
-let env = Environment::new(_dir.path()).unwrap();
+let env = canopydb::Environment::new(_dir.path()).unwrap();
 
 let db1 = env.get_or_create_database("db1").unwrap();
 let db2 = env.get_or_create_database("db2").unwrap();
