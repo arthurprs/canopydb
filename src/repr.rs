@@ -8,7 +8,7 @@ use zerocopy::*;
 use crate::{node::NodeType, utils::EscapedBytes, PAGE_SIZE};
 
 pub type DbId = u128;
-pub type TreeId = u64;
+pub type TreeId = u128;
 pub type TxId = u64;
 pub type PageId = u32;
 pub type WalIdx = u64;
@@ -209,7 +209,6 @@ pub struct MetapageHeader {
     /// Last WalIdx part of the snapshot (exclusive)
     pub wal_end: WalIdx,
     pub snapshot_tx_id: TxId,
-    pub next_tree_id: TreeId,
     pub trees_tree: TreeValue,
     pub _padding1: u8,
     pub indirections_tree: TreeValue,
@@ -262,13 +261,10 @@ pub struct TreeValue {
 
 impl std::fmt::Debug for TreeValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let id = self.id;
-        let root = self.root;
-        let num_keys = self.num_keys;
         f.debug_struct("TreeValue")
-            .field("id", &id)
-            .field("root", &root)
-            .field("num_keys", &num_keys)
+            .field("id", &{ self.id })
+            .field("root", &{ self.root })
+            .field("num_keys", &{ self.num_keys })
             .field("nodes_compressed", &self.nodes_compressed)
             .field("overflow_compressed", &self.overflow_compressed)
             .field("min_branch_node_pages", &self.min_branch_node_pages)

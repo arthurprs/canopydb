@@ -34,6 +34,62 @@ pub struct Freelist {
     shards: Option<Arc<ShardsVec>>,
 }
 
+/// Like free list but can deffer merges and serve bulk_allocate from deferred Freelists
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DeferredFreelist {
+    freelist: Freelist,
+    deferred: Vec<Freelist>,
+}
+
+impl DeferredFreelist {
+    pub fn bulk_allocate(
+        &mut self,
+        min_span: PageId,
+        bulk_span: PageId,
+        precise: bool,
+    ) -> Result<Freelist, Error> {
+        if self.deferred.last().is_some_and(|f| f.len() >= min_span) {
+            return Ok(self.deferred.pop().unwrap());
+        }
+        Ok(self.merged()?.bulk_allocate(bulk_span, precise))
+    }
+
+    pub fn append(&mut self, other: Freelist) {
+        if !other.is_empty() {
+            self.deferred.push(other);
+        }
+    }
+
+    pub fn into_merged(mut self) -> Result<Freelist, Error> {
+        Ok(mem::take(self.merged()?))
+    }
+
+    pub fn merged(&mut self) -> Result<&mut Freelist, Error> {
+        for f in self.deferred.drain(..) {
+            self.freelist.merge(&f)?;
+        }
+        Ok(&mut self.freelist)
+    }
+
+    pub fn max_serialized_size(&self) -> usize {
+        self.freelist.serialized_size()
+            + self
+                .deferred
+                .iter()
+                .map(Freelist::serialized_size)
+                .sum::<usize>()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.freelist.is_empty() && self.deferred.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> PageId {
+        self.freelist.len() + self.deferred.iter().map(Freelist::len).sum::<PageId>()
+    }
+}
+
 /// A Freelist shard that can track pages in the range of base..base+SHARD_MAX_LEN.
 /// For 4K pages and SHARD_MAX_LEN 2**16, each shard spans 256MB.
 #[derive(Debug, Clone, PartialEq)]
@@ -51,8 +107,9 @@ struct Shard {
     ranges: Arc<RangeVec>,
 }
 
-#[derive(Copy, Clone, Default, PartialEq, FromZeroes, AsBytes, FromBytes)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, FromZeroes, AsBytes, FromBytes)]
 #[repr(C)]
+#[debug("Range({page}, {zspan})")]
 struct Range {
     /// The start of the range within the shard
     page: u16,
@@ -79,13 +136,6 @@ impl Range {
     #[inline]
     fn page_end(&self) -> PageId {
         self.page() + self.span()
-    }
-}
-
-impl std::fmt::Debug for Range {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (a, b) = (self.page, self.zspan);
-        f.debug_tuple("Range").field(&a).field(&b).finish()
     }
 }
 
@@ -333,37 +383,33 @@ impl Shard {
         debug_assert!(span > 0);
         let zspan = (span - 1) as u16;
         let pos = if zspan == 0 {
-            self.ranges.len().checked_sub(1)
+            self.ranges.len().checked_sub(1)?
         } else if self.hist.any_gte(zspan) {
-            Self::find_zspan_gte(&self.ranges, zspan)
+            Self::find_zspan_gte(&self.ranges, zspan)?
         } else {
-            None
+            return None;
         };
 
-        if let Some(pos) = pos {
-            self.len -= span;
-            let ranges = range_vec_make_mut(&mut self.ranges, 0);
-            let r = ranges[pos];
-            debug_assert!(r.zspan >= zspan, "{pos}");
-            self.hist.dec(r.zspan, 1);
-            if r.zspan == zspan {
-                if pos + 1 == ranges.len() {
-                    // Pop avoids a call to memmove
-                    ranges.pop();
-                } else {
-                    ranges.remove(pos);
-                }
+        self.len -= span;
+        let ranges = range_vec_make_mut(&mut self.ranges, 0);
+        let r = ranges[pos];
+        debug_assert!(r.zspan >= zspan, "{pos}");
+        self.hist.dec(r.zspan, 1);
+        if r.zspan == zspan {
+            if pos + 1 == ranges.len() {
+                // Pop avoids a call to memmove
+                ranges.pop();
             } else {
-                self.hist.inc(r.zspan - (zspan + 1), 1);
-                ranges[pos] = Range {
-                    page: r.page + zspan + 1,
-                    zspan: r.zspan - (zspan + 1),
-                };
+                ranges.remove(pos);
             }
-            Some(self.base + r.page())
         } else {
-            None
+            self.hist.inc(r.zspan - (zspan + 1), 1);
+            ranges[pos] = Range {
+                page: r.page + zspan + 1,
+                zspan: r.zspan - (zspan + 1),
+            };
         }
+        Some(self.base + r.page())
     }
 
     #[cfg(not(feature = "nightly"))]
@@ -521,7 +567,7 @@ impl Shard {
         if self
             .ranges
             .first()
-            .map_or(true, |r| self.base + r.page_end() <= right_gte)
+            .is_none_or(|r| self.base + r.page_end() <= right_gte)
         {
             return other;
         }
@@ -553,6 +599,57 @@ impl Shard {
         }
         ranges.drain(0..full_moves);
         other
+    }
+
+    fn subtract(&mut self, other_shard: &Self) {
+        if other_shard.ranges.len() < self.ranges.len() {
+            for (page_id, span) in other_shard.iter_spans() {
+                self.remove(page_id, span);
+            }
+            return;
+        }
+        self.len = 0;
+        self.hist.0.fill(0);
+        let ranges = range_vec_make_mut(&mut self.ranges, 0);
+        let this_ranges = mem::take(ranges)
+            .into_iter()
+            .map(|r| r.page()..r.page_end());
+        let mut other_ranges = other_shard
+            .ranges
+            .iter()
+            .map(|r| r.page()..r.page_end())
+            .peekable();
+        let mut push_non_empty = |r: std::ops::Range<PageId>| {
+            let range = Range {
+                page: r.start as u16,
+                zspan: (r.len() - 1) as u16,
+            };
+            self.hist.inc(range.zspan, 1);
+            self.len += range.span();
+            ranges.push(range);
+        };
+        for mut r in this_ranges {
+            loop {
+                if let Some(d) = other_ranges.peek() {
+                    if d.start >= r.end {
+                        other_ranges.next();
+                        continue;
+                    }
+                    let intersect = r.start.max(d.start)..r.end.min(d.end);
+                    let hi = intersect.end.max(r.start)..r.end;
+                    r = r.start..intersect.start.min(r.end);
+                    if !hi.is_empty() {
+                        push_non_empty(hi);
+                    }
+                    if r.is_empty() {
+                        break;
+                    }
+                } else {
+                    push_non_empty(r);
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -636,7 +733,7 @@ impl Freelist {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.shards.as_ref().map_or(true, |s| s.is_empty())
+        self.shards.as_ref().is_none_or(|s| s.is_empty())
     }
 
     pub fn len(&self) -> PageId {
@@ -852,16 +949,12 @@ impl Freelist {
 
     pub fn allocate(&mut self, span: PageId) -> Option<PageId> {
         debug_assert_ne!(span, 0);
-        if span == 0 || span > MAX_ALLOCATION_SPAN || self.shards.is_none() {
+        if span == 0 || span > MAX_ALLOCATION_SPAN {
             return None;
         }
-        let len_before = if cfg!(debug_assertions) {
-            self.len()
-        } else {
-            0
-        };
-        let shards: &mut ShardsVec =
-            Arc::make_mut(self.shards.get_or_insert_with(Default::default));
+        #[cfg(debug_assertions)]
+        let len_before = self.len();
+        let shards = Arc::make_mut(self.shards.as_mut()?);
         let mut result = None;
         if span <= SHARD_MAX_LEN {
             let mut i = 0;
@@ -871,6 +964,7 @@ impl Freelist {
                     if shard.is_empty() {
                         shards.remove(i);
                     }
+                    #[cfg(debug_assertions)]
                     debug_assert_eq!(len_before - span, self.len());
                     result = Some(p);
                     break;
@@ -884,6 +978,7 @@ impl Freelist {
         } else {
             result = Self::allocate_cross_shard(shards, span, 0..shards.len());
         }
+        #[cfg(debug_assertions)]
         debug_assert_eq!(len_before - result.map_or(0, |_| span), self.len());
         #[cfg(any(test, fuzzing))]
         debug_assert!(self.validate());
@@ -891,18 +986,18 @@ impl Freelist {
     }
 
     pub fn remove(&mut self, mut page_id: PageId, mut span: PageId) -> PageId {
-        let len_before = if cfg!(debug_assertions) {
-            self.len()
-        } else {
-            0
+        #[cfg(debug_assertions)]
+        let len_before = self.len();
+        let Some(shards) = self.shards.as_mut() else {
+            return 0;
         };
         let mut removed = 0;
-        let shards = Arc::make_mut(self.shards.get_or_insert_with(Default::default));
         while span != 0 {
             let base = page_id / SHARD_MAX_LEN * SHARD_MAX_LEN;
             let base_end = base + SHARD_MAX_LEN;
             let span_for_shard = span.min(base_end - page_id);
             if let Ok(shard_pos) = shards.binary_search_by_key(&base, |s| s.base) {
+                let shards = Arc::make_mut(shards);
                 let shard = &mut shards[shard_pos];
                 removed += shard.remove(page_id, span_for_shard);
                 if shard.is_empty() {
@@ -912,16 +1007,25 @@ impl Freelist {
             span -= span_for_shard;
             page_id += span_for_shard;
         }
+        #[cfg(debug_assertions)]
         debug_assert_eq!(len_before - self.len(), removed);
         removed
     }
 
     pub fn subtract(&mut self, other: &Self) {
-        if self.is_empty() {
+        let Some((shards, other_shards)) = self.shards.as_mut().zip(other.shards.as_deref()) else {
             return;
-        }
-        for (page_id, span) in other.iter_spans() {
-            self.remove(page_id, span);
+        };
+        for other_shard in other_shards {
+            let Ok(shard_pos) = shards.binary_search_by_key(&other_shard.base, |s| s.base) else {
+                continue;
+            };
+            let shards = Arc::make_mut(shards);
+            let shard = &mut shards[shard_pos];
+            shard.subtract(other_shard);
+            if shard.is_empty() {
+                shards.remove(shard_pos);
+            }
         }
         #[cfg(any(test, fuzzing))]
         debug_assert!(self.validate());
@@ -930,7 +1034,7 @@ impl Freelist {
     fn validate(&self) -> bool {
         self.shards
             .as_ref()
-            .map_or(true, |s| s.iter().all(|s| s.validate() && !s.is_empty()))
+            .is_none_or(|s| s.iter().all(|s| s.validate() && !s.is_empty()))
     }
 }
 
@@ -1261,8 +1365,8 @@ mod proptests {
 
         #[test]
         fn subtract(
-            mut this in prop::collection::btree_set(60_000u32..70_000, 0..5_000),
-            that in prop::collection::btree_set(60_000u32..70_000, 0..5_000)
+            mut this in prop::collection::btree_set(60_000u32..70_000, 0..10_000),
+            that in prop::collection::btree_set(60_000u32..70_000, 0..10_000)
         ) {
             let mut a = Freelist::from_set(&this);
             let b = Freelist::from_set(&that);

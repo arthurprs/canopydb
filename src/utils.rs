@@ -422,7 +422,7 @@ impl Trap {
     }
 }
 
-impl<'a> TrapGuard<'a> {
+impl TrapGuard<'_> {
     #[inline]
     pub fn disarm(mut self) {
         debug_assert!(self.0.is_some());
@@ -430,7 +430,7 @@ impl<'a> TrapGuard<'a> {
     }
 }
 
-impl<'a> Drop for TrapGuard<'a> {
+impl Drop for TrapGuard<'_> {
     #[inline]
     fn drop(&mut self) {
         if let Some(arc) = &self.0 {
@@ -511,7 +511,7 @@ impl<T> WaitJoinHandle<T> {
     }
 }
 
-#[derive(Display)]
+#[derive(Display, PartialEq, Eq)]
 #[display("{:?}", self)]
 /// Outputs bytes as escaped ascii strings
 pub struct EscapedBytes<'a>(pub &'a [u8]);
@@ -534,6 +534,7 @@ impl std::fmt::Debug for EscapedBytes<'_> {
         Ok(())
     }
 }
+
 #[derive(Display)]
 #[display("{:?}", self)]
 /// Outputs bytes sizes as human sizes
@@ -556,7 +557,6 @@ impl std::fmt::Debug for ByteSize {
 
 pub trait CellExt<T> {
     fn reset<F: FnOnce(T) -> T>(&self, f: F);
-    fn reset_with<F: FnOnce(&mut T)>(&self, f: F);
 }
 
 impl<T: Copy> CellExt<T> for std::cell::Cell<T> {
@@ -564,13 +564,6 @@ impl<T: Copy> CellExt<T> for std::cell::Cell<T> {
     fn reset<F: FnOnce(T) -> T>(&self, f: F) {
         let mut v = self.get();
         v = f(v);
-        self.set(v);
-    }
-
-    #[inline]
-    fn reset_with<F: FnOnce(&mut T)>(&self, f: F) {
-        let mut v = self.get();
-        f(&mut v);
         self.set(v);
     }
 }

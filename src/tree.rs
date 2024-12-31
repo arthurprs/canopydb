@@ -1,5 +1,5 @@
 use crate::{
-    cursor::{BaseIter, Cursor, RangeIter, RangeKeysIter},
+    cursor::{BaseIter, RangeIter, RangeKeysIter},
     error::{error_validation, Error},
     node::*,
     page::Page,
@@ -12,7 +12,6 @@ use crate::{
 use smallvec::SmallVec;
 use std::{
     cell::RefCell,
-    cmp::Ordering,
     ops::{Bound, RangeBounds},
 };
 use triomphe::Arc;
@@ -77,19 +76,30 @@ pub struct Tree<'tx> {
     pub(crate) tx: &'tx Transaction,
     pub(crate) name: Option<Arc<[u8]>>,
     pub(crate) value: TreeValue,
+    pub(crate) len_delta: i64,
     pub(crate) dirty: bool,
     pub(crate) cached_root: RefCell<Option<UntypedNode>>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TreeState {
-    Available { value: TreeValue, dirty: bool },
-    Deleted,
-    InUse { value: TreeValue },
+    Available {
+        value: TreeValue,
+        dirty: bool,
+        len_delta: i64,
+    },
+    InUse {
+        value: TreeValue,
+    },
+    Deleted {
+        value: TreeValue,
+    },
 }
 
+#[derive(Debug)]
 enum MutateResult {
     Ok(PageId),
+    #[debug("Split(_0, _1, {})", EscapedBytes(_2))]
     Split(PageId, PageId, Vec<u8>),
     Underflow(PageId),
 }
@@ -100,6 +110,7 @@ impl std::fmt::Debug for Tree<'_> {
             .field("name", &self.name.as_deref().map(EscapedBytes))
             .field("len", &{ self.value.num_keys })
             .field("level", &self.value.level)
+            .field("len_delta", &self.len_delta)
             .field("dirty", &self.dirty)
             .finish()
     }
@@ -114,22 +125,8 @@ impl Drop for Tree<'_> {
             *self.tx.trees.borrow_mut().get_mut(name).unwrap() = TreeState::Available {
                 value: self.value,
                 dirty: self.dirty,
+                len_delta: self.len_delta,
             };
-        }
-    }
-}
-
-impl std::fmt::Debug for MutateResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Ok(arg0) => f.debug_tuple("Ok").field(arg0).finish(),
-            Self::Split(arg0, arg1, arg2) => f
-                .debug_tuple("Split")
-                .field(arg0)
-                .field(arg1)
-                .field(&EscapedBytes(arg2))
-                .finish(),
-            Self::Underflow(arg0) => f.debug_tuple("Underflow").field(arg0).finish(),
         }
     }
 }
@@ -163,12 +160,11 @@ impl<'tx> Tree<'tx> {
 
     #[inline]
     fn inc_num_keys(&mut self, delta: i64) {
-        match delta.cmp(&0) {
-            Ordering::Less => self.value.num_keys -= (-delta) as u64,
-            Ordering::Greater => self.value.num_keys += delta as u64,
-            Ordering::Equal => return,
+        if delta != 0 {
+            self.value.num_keys = self.value.num_keys.wrapping_add_signed(delta);
+            self.len_delta += delta;
+            self.dirty = true;
         }
-        self.dirty = true;
     }
 
     #[cfg(any(fuzzing, test))]
@@ -483,7 +479,7 @@ impl<'tx> Tree<'tx> {
             ));
         }
         if self.value.fixed_value_len >= 0 {
-            if value.map_or(false, |v| v.len() != self.value.fixed_value_len as usize) {
+            if value.is_some_and(|v| v.len() != self.value.fixed_value_len as usize) {
                 return Err(error_validation!(
                     "Tree only accepts values of length {}",
                     self.value.fixed_value_len
@@ -645,7 +641,7 @@ impl<'tx> Tree<'tx> {
             match Self::insert_kv(tree, prefix, &mut node, search, full_key, value)? {
                 Ok(()) => {
                     trace!(
-                        "inserted {:?} in leaf {} {:?}, num_keys {}",
+                        "inserted `{:?}` in leaf {} {:?}, num_keys {}",
                         &EscapedBytes(full_key),
                         node.id(),
                         search,
@@ -661,7 +657,7 @@ impl<'tx> Tree<'tx> {
         } else if let Ok(idx) = search {
             tree.inc_num_keys(-1);
             trace!(
-                "delete {:?} in leaf {} pos {:?}",
+                "delete `{:?}` in leaf {} pos {:?}",
                 &EscapedBytes(full_key),
                 node.id(),
                 search
@@ -669,6 +665,8 @@ impl<'tx> Tree<'tx> {
             let mut node_mut = tree.tx.make_dirty(&mut node)?;
             tree.free_value(&node_mut.value_at(idx))?;
             node_mut.remove_key_repr_at(idx);
+        } else if tree.tx.is_multi_write_tx() {
+            tree.tx.make_dirty(&mut node)?;
         }
 
         let (id, num_keys) = (node.id(), node.num_keys());
@@ -881,8 +879,9 @@ impl<'tx> Tree<'tx> {
     }
 
     /// Returns the Tree's Cursor
-    pub(crate) fn cursor(&self) -> Cursor<'tx, '_> {
-        Cursor::new(self)
+    #[cfg(test)]
+    pub(crate) fn cursor(&self) -> crate::cursor::Cursor<'tx, '_> {
+        crate::cursor::Cursor::new(self)
     }
 
     /// Returns an iterator over the key value pairs of the specified range.
@@ -1129,6 +1128,9 @@ fn node_split_right<TYPE: NodeRepr>(
             tree.allocate_node(right_size, Some(node.header().level))?,
         );
         right.as_dirty().set_key_prefix(&right_prefix);
+        if tree.tx.is_multi_write_tx() {
+            tree.tx.make_dirty(node)?;
+        }
         return Ok((false, full_separator, right));
     }
 
@@ -1561,12 +1563,12 @@ fn remove_range_node(
         let mut node = node.into_leaf();
         let start_i = search_bound(&node, start, false);
         let end_i = search_bound(&node, end, true);
-        if start_i >= end_i {
+        if !tree.tx.is_multi_write_tx() && start_i >= end_i {
             let id = node.id();
             tree.tx.stash_node(node)?;
             return Ok(MutateResult::Ok(id));
         }
-        tree.inc_num_keys(-((end_i - start_i) as i64));
+        tree.inc_num_keys(-(end_i.saturating_sub(start_i) as i64));
         if start_i == 0 && end_i == node.num_keys() {
             for (ov_id, ov_span) in node.overflow_children() {
                 tree.tx.free_page_with_id(ov_id, ov_span)?;

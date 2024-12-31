@@ -565,6 +565,38 @@ fn delete_range_stub(items: u32, root_level: u8) {
 }
 
 #[test]
+fn multi_writer() {
+    let _ = env_logger::try_init();
+    let _f = test_folder();
+    let mut options = EnvOptions::new(_f.path());
+    // all databases in the same environment will share this 1GB cache
+    options.page_cache_size = 1024 * 1024 * 1024;
+    let env = Environment::with_options(options).unwrap();
+
+    let db1 = env.get_or_create_database("db1").unwrap();
+    let tx1 = db1.begin_write_with(true).unwrap();
+    let mut tree1 = tx1.get_or_create_tree(b"my_tree").unwrap();
+    for i in 0..200 {
+        tree1.insert(format!("foo{i}").as_bytes(), b"bar").unwrap();
+    }
+    drop(tree1);
+    tx1.commit().unwrap();
+    // Each database unique write transaction is independent.
+    let tx1 = db1.begin_write_with(true).unwrap();
+    let tx2 = db1.begin_write_with(true).unwrap();
+    let mut tree1 = tx1.get_or_create_tree(b"my_tree").unwrap();
+    let mut tree2 = tx2.get_or_create_tree(b"my_tree").unwrap();
+    tree1.insert(b"foo0", b"bar").unwrap();
+    tree2.insert(b"foo99", b"bar").unwrap();
+    let maybe_value = tree1.get(b"foo0").unwrap();
+    assert_eq!(maybe_value.as_deref(), Some(&b"bar"[..]));
+    drop(tree1);
+    drop(tree2);
+    tx1.commit().unwrap();
+    tx2.commit().unwrap();
+}
+
+#[test]
 fn read_tx_snapshot_works() {
     let _ = env_logger::try_init();
     let mut rng = get_rng();
@@ -652,10 +684,7 @@ fn delete_works() {
                 let deleted = tree.delete(k.as_bytes()).unwrap();
                 assert!(deleted);
             }
-
-            let mut cursor = tree.cursor();
-            assert!(!cursor.first().unwrap());
-            drop(cursor);
+            assert!(tree.keys().unwrap().next().is_none());
             assert_eq!(tree.len(), 0);
         } else if _round_no % 100 == 0 {
             for k in master_sample
@@ -692,9 +721,7 @@ fn delete_works() {
         let deleted = tree.delete(k.as_bytes()).unwrap();
         assert!(deleted);
     }
-    let mut cursor = tree.cursor();
-    assert!(!cursor.first().unwrap());
-    drop(cursor);
+    assert!(tree.keys().unwrap().next().is_none());
     assert_eq!(tree.len(), 0);
     drop(tree);
     tx.commit().unwrap();
@@ -1071,8 +1098,7 @@ fn recover_then_checkpoint() {
             tree.insert(k.as_bytes(), v.as_bytes()).unwrap();
         }
         drop(tree);
-        latest_tx_id = tx.tx_id();
-        tx.commit().unwrap();
+        latest_tx_id = tx.commit().unwrap();
         master_sample.extend(sample.into_iter());
     }
 
@@ -1137,8 +1163,7 @@ fn recovery() {
             tree.insert(k.as_bytes(), v.as_bytes()).unwrap();
         }
         drop(tree);
-        latest_tx_id = tx.tx_id();
-        tx.commit().unwrap();
+        latest_tx_id = tx.commit().unwrap();
         master_sample.extend(sample.into_iter());
     }
 

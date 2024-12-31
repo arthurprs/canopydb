@@ -96,7 +96,8 @@ impl From<Item> for InnerItem {
 #[derive(Debug, Default)]
 #[repr(C, align(64))]
 pub(crate) struct PageTable {
-    table: DashMap<PageId, SmallVec<(TxId, InnerItem), 1>, foldhash::fast::RandomState>,
+    // Using quality for the time being to avoid degenerate cases https://github.com/rust-lang/hashbrown/issues/577
+    table: DashMap<PageId, SmallVec<(TxId, InnerItem), 1>, foldhash::quality::RandomState>,
     spans_used: AtomicIsize,
 }
 
@@ -111,11 +112,18 @@ impl PageTable {
         tx_id: TxId,
         page_id: PageId,
         item: impl Into<Option<Item>>,
+        force: bool,
     ) -> Option<TxId> {
-        self.insert_with(tx_id, page_id, item, |last_tx_id, last_i| match last_i {
-            InnerItem::Page(..) => Some(last_tx_id),
-            InnerItem::Redirected(..) | InnerItem::None => None,
-        })
+        self.insert_with(
+            tx_id,
+            page_id,
+            item,
+            force,
+            |last_tx_id, last_i| match last_i {
+                InnerItem::Page(..) => Some(last_tx_id),
+                InnerItem::Redirected(..) | InnerItem::None => None,
+            },
+        )
     }
 
     pub fn insert_w_shadowed(
@@ -123,8 +131,9 @@ impl PageTable {
         tx_id: TxId,
         page_id: PageId,
         item: impl Into<Option<Item>>,
+        force: bool,
     ) -> Option<(TxId, Item)> {
-        self.insert_with(tx_id, page_id, item, |last_tx_id, last_i| {
+        self.insert_with(tx_id, page_id, item, force, |last_tx_id, last_i| {
             Some((last_tx_id, last_i.to_item()?))
         })
     }
@@ -135,22 +144,28 @@ impl PageTable {
         tx_id: TxId,
         page_id: PageId,
         item: impl Into<Option<Item>>,
+        force: bool,
         map: impl FnOnce(TxId, &InnerItem) -> Option<T>,
     ) -> Option<T> {
         let item = item.into();
         trace!(
             "{} tx_id {tx_id} page {page_id} is_page {:?}",
-            if item.is_some() { "insert" } else { "remove " },
+            if item.is_some() { "insert" } else { "remove" },
             matches!(item, Some(Item::Page(_)))
         );
         let i_item;
-        let mut values = if let Some(item) = item {
+        let create = if let Some(item) = item {
             i_item = InnerItem::from(item);
             self.spans_used
                 .fetch_add(i_item.pages() as isize, Ordering::Relaxed);
-            self.table.entry(page_id).or_default()
+            true
         } else {
             i_item = InnerItem::None;
+            force
+        };
+        let mut values = if create {
+            self.table.entry(page_id).or_default()
+        } else {
             self.table.get_mut(&page_id)?
         };
         let result = values.last().and_then(|(last_tx_id, last_i)| {
@@ -165,52 +180,45 @@ impl PageTable {
         trace!("replace at tx_id {tx_id} page {page_id}");
         let item = InnerItem::from(item);
         let item_pages = item.pages() as isize;
-        if let dashmap::mapref::entry::Entry::Occupied(mut o) = self.table.entry(page_id) {
-            let (last, rest) = o.get_mut().split_last_mut().unwrap();
-            let (target_item, latest) = if last.0 == tx_id {
-                (&mut last.1, true)
-            } else {
-                match rest.binary_search_by(|(i, _)| i.cmp(&tx_id)) {
-                    Ok(i) => (&mut rest[i].1, false),
-                    Err(_) => return None,
-                }
-            };
-            let replaced = mem::replace(target_item, item);
-            drop(o);
-            let page_delta = item_pages - replaced.pages() as isize;
-            self.spans_used.fetch_add(page_delta, Ordering::Relaxed);
-            Some((replaced.into_item()?, latest))
-        } else {
-            None
-        }
+        let dashmap::mapref::entry::Entry::Occupied(mut o) = self.table.entry(page_id) else {
+            return None;
+        };
+        let values = o.get_mut();
+        let (latest, replaced) = match values.binary_search_by(|(i, _)| i.cmp(&tx_id)) {
+            Ok(i) => (i + 1 == values.len(), mem::replace(&mut values[i].1, item)),
+            Err(_) => return None,
+        };
+        drop(o);
+        let page_delta = item_pages - replaced.pages() as isize;
+        self.spans_used.fetch_add(page_delta, Ordering::Relaxed);
+        Some((replaced.into_item()?, latest))
     }
 
     pub fn remove_at(&self, tx_id: TxId, page_id: PageId) -> Option<Item> {
         trace!("remove_at tx_id {tx_id} page {page_id}");
         let _removed_vec; // make sure removed vecs are dropped outside the lock
+        let removed;
         if let dashmap::mapref::entry::Entry::Occupied(mut o) = self.table.entry(page_id) {
             let values = o.get_mut();
-            match values.binary_search_by(|(i, _)| i.cmp(&tx_id)) {
-                Ok(i) => {
-                    let (_, item) = &mut values[i];
-                    let removed = mem::replace(item, InnerItem::None);
-                    if i == 0 {
-                        let nones = 1 + values[1..].iter().take_while(|(_, i)| i.is_none()).count();
-                        if nones < values.len() {
-                            values.drain(..nones);
-                        } else {
-                            _removed_vec = o.remove();
-                        }
-                    }
-                    self.spans_used
-                        .fetch_sub(removed.pages() as isize, Ordering::Relaxed);
-                    removed.into_item()
+            let Ok(i) = values.binary_search_by(|(i, _)| i.cmp(&tx_id)) else {
+                return None;
+            };
+            removed = mem::replace(&mut values[i].1, InnerItem::None);
+            if i == 0 {
+                let nones = 1 + values[1..].iter().take_while(|(_, i)| i.is_none()).count();
+                if nones < values.len() {
+                    values.drain(..nones);
+                } else {
+                    _removed_vec = o.remove();
                 }
-                Err(_) => None,
             }
         } else {
-            None
+            return None;
         }
+
+        self.spans_used
+            .fetch_sub(removed.pages() as isize, Ordering::Relaxed);
+        removed.into_item()
     }
 
     #[inline]
@@ -241,6 +249,15 @@ impl PageTable {
     pub fn get(&self, tx_id: TxId, page_id: PageId) -> Option<(TxId, Item)> {
         trace!("get tx_id {tx_id} page {page_id}");
         self.peek(tx_id, page_id, |from, item| Some((from, item.to_item()?)))
+    }
+
+    pub fn is_latest_from_lte(&self, tx_id: TxId, page_id: PageId) -> bool {
+        trace!("is_latest_from_lte tx_id {tx_id} page {page_id}");
+        if let Some(values) = self.table.get(&page_id) {
+            values.last().is_none_or(|&(from, _)| from <= tx_id)
+        } else {
+            true
+        }
     }
 
     pub fn is_page_from_snapshot(
@@ -301,7 +318,7 @@ impl PageTable {
         let mut drop_list = SmallVec::<InnerItem, 20>::new();
         self.table.retain(|_page_id, values| {
             debug_assert!(values.last().unwrap().0 <= tx_id);
-            if values.last().map_or(false, |(i, _)| i == &tx_id) {
+            if values.last().is_some_and(|(i, _)| i == &tx_id) {
                 let (_, pop) = values.pop().unwrap();
                 drop_list.push(pop);
                 !values.is_empty()

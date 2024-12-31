@@ -7,6 +7,7 @@ use std::{
 
 use crate::{
     repr::{DbId, TreeId},
+    utils::EscapedBytes,
     EnvOptions, TreeOptions,
 };
 
@@ -20,8 +21,11 @@ pub struct WriteBatch {
     inner: WriteBatchInner,
 }
 
+#[derive(Debug)]
 enum WriteBatchInner {
+    #[debug("InMemory({})", _0.len())]
     InMemory(Vec<u8>),
+    #[debug("DiskWriter(..)")]
     DiskWriter(BufWriter<File>),
 }
 
@@ -38,11 +42,17 @@ mod op_bytes {
 #[derive(Debug)]
 pub enum Operation {
     Database(DbId),
+    #[debug("Insert({_0}, {}, {})", EscapedBytes(_1), EscapedBytes(_2))]
     Insert(TreeId, Vec<u8>, Vec<u8>),
+    #[debug("Delete({_0}, {})", EscapedBytes(_1))]
     Delete(TreeId, Vec<u8>),
+    #[debug("DeleteRange({_0}, ({:?}, {:?}))", _1.0.as_ref().map(|a| EscapedBytes(a)),  _1.1.as_ref().map(|a| EscapedBytes(a)))]
     DeleteRange(TreeId, (Bound<Vec<u8>>, Bound<Vec<u8>>)),
-    CreateTree(Vec<u8>, TreeOptions),
+    #[debug("CreateTree({_0}, {}, {_2:?})", EscapedBytes(_1))]
+    CreateTree(TreeId, Vec<u8>, TreeOptions),
+    #[debug("DeleteTree({})", EscapedBytes(_0))]
     DeleteTree(Vec<u8>),
+    #[debug("RenameTree({}, {})", EscapedBytes(_0), EscapedBytes(_1))]
     RenameTree(Vec<u8>, Vec<u8>),
 }
 
@@ -135,10 +145,12 @@ impl WriteBatch {
                         Operation::DeleteRange(tree_id, (start, end))
                     }
                     op_bytes::CREATE_TREE => {
+                        let mut tree_id = TreeId::default();
+                        bytes.read_exact(tree_id.as_bytes_mut())?;
                         let tree_name = read_u32_prefixed_bytes(bytes)?;
                         let options = read_u32_prefixed_bytes(bytes)?;
                         let options = TreeOptions::from_bytes(&options)?;
-                        Operation::CreateTree(tree_name, options)
+                        Operation::CreateTree(tree_id, tree_name, options)
                     }
                     op_bytes::DELETE_TREE => {
                         let tree_name = read_u32_prefixed_bytes(bytes)?;
@@ -192,7 +204,7 @@ impl WriteBatch {
         start: Bound<&[u8]>,
         end: Bound<&[u8]>,
     ) -> io::Result<()> {
-        let mut se = (([0u8], 0u32), ([0], 0));
+        let mut se = ((0u8, 0u32), (0u8, 0u32));
         let mut parts = SmallVec::<&[u8], 8>::new();
         parts.push(&[op_bytes::DELETE_RANGE]);
         parts.push(tree.as_bytes());
@@ -200,22 +212,29 @@ impl WriteBatch {
             match bound {
                 Bound::Unbounded => parts.push(&[0]),
                 Bound::Included(b) | Bound::Excluded(b) => {
-                    *u = [1 + matches!(bound, Bound::Excluded(_)) as u8];
+                    *u = 1 + matches!(bound, Bound::Excluded(_)) as u8;
                     *l = b.len() as u32;
-                    parts.extend_from_slice(&[u, l.as_bytes(), b]);
+                    parts.extend_from_slice(&[std::slice::from_ref(u), l.as_bytes(), b]);
                 }
             }
         }
         self.write_many(&parts)
     }
 
-    pub fn push_create_tree(&mut self, tree: &[u8], options: &[u8]) -> io::Result<()> {
+    pub fn push_create_tree(
+        &mut self,
+        tree_id: &TreeId,
+        tree: &[u8],
+        options: &TreeOptions,
+    ) -> io::Result<()> {
+        let options = options.to_bytes();
         self.write_many(&[
             &[op_bytes::CREATE_TREE],
+            tree_id.as_bytes(),
             (tree.len() as u32).as_bytes(),
             tree,
             (options.len() as u32).as_bytes(),
-            options,
+            &options,
         ])
     }
 
@@ -287,15 +306,6 @@ impl WriteBatch {
         match &mut self.inner {
             WriteBatchInner::InMemory(mem) => mem.clear(),
             WriteBatchInner::DiskWriter(_) => self.inner = WriteBatchInner::InMemory(Vec::new()),
-        }
-    }
-}
-
-impl std::fmt::Debug for WriteBatchInner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InMemory(arg0) => f.debug_tuple("InMemory").field(&arg0.len()).finish(),
-            Self::DiskWriter(_) => f.debug_tuple("DiskWriter").finish(),
         }
     }
 }

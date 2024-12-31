@@ -66,7 +66,7 @@ use crate::{
     pagetable::{Item, PageTable},
     repr::*,
     shim::{
-        parking_lot::{Condvar, Mutex, RawMutex, RwLock},
+        parking_lot::{Condvar, Mutex, RawMutex, RawRwLock, RwLock},
         sync::{atomic, mpsc, Arc as StdArc, Weak as StdWeak},
         thread,
     },
@@ -89,7 +89,7 @@ type HashSet<K> = hash_set::HashSet<K, foldhash::fast::RandomState>;
 type HashMap<K, V> = hash_map::HashMap<K, V, foldhash::fast::RandomState>;
 
 use env::EnvironmentHandle;
-use lock_api::ArcMutexGuard;
+use lock_api::{ArcMutexGuard, ArcRwLockReadGuard, ArcRwLockWriteGuard};
 use smallvec::SmallVec;
 use triomphe::Arc;
 use zerocopy::*;
@@ -115,21 +115,22 @@ bitflags::bitflags! {
     #[derive(Default, Copy, Clone)]
     struct TransactionFlags: u8 {
         /// Set if the txn was committed or rolledback
-        const DONE = 0b00000001;
+        const DONE = 1;
         /// Set if the txn altered anything
-        const DIRTY = 0b00000010;
-        /// Set for write transactions
-        const WRITE_TX = 0b00000100;
+        const DIRTY = 1 << 1;
+        /// Set for all kinds of write transactions
+        const WRITE_TX = 1 << 2;
+        /// Set for multi write transactions
+        const MULTI_WRITE_TX = 1 << 3;
         /// Set for checkpoint transactions
-        const CHECKPOINT_TX = 0b00001000;
+        const CHECKPOINT_TX = 1 << 4;
+        /// Set when the page table is dirty and may need cleanup on rollback
+        const PAGE_TABLE_DIRTY = 1 << 5;
     }
 }
 use TransactionFlags as TF;
 
-/// Write transaction
-///
-/// Only one active write transaction can be active at a given time (similar to a Mutex).
-/// This property is automatically enforced by the Database.
+/// # Write transaction
 ///
 /// A Write transaction can mutate data and read its own changes. Any changes must be committed
 /// by calling [WriteTransaction::commit]. Once committed, subsequent transactions will see changes
@@ -143,6 +144,33 @@ use TransactionFlags as TF;
 /// Note that this limit doesn't include previously committed versions from previous
 /// write transactions. Once committed, these changes are considered committed
 /// and count towards the [DbOptions::checkpoint_target_size] and other memory limits.
+///
+/// ## Exclusive Write Transactions
+///
+/// Only one active write transaction can be active at a given time (similar to a Mutex).
+/// This property is automatically enforced by the Database.
+///
+/// Unlike Concurrent Write Transactions, commit cannot error with [`Error::WriteConflict`].
+///
+/// ## Concurrent Write Transactions
+///
+/// Write transactions may run concurrently and conflict detection is performed at commit time.
+/// Applications utilizing this often require wraping write transaction blocks in a loop and retry
+/// the transaction if [`WriteTransaction::commit`] returns [`Error::WriteConflict`].
+///
+/// These transactions provide Snapshot-Isolation (SI) instead of _Serializable_-Snapshot-Isolation (SSI) as
+/// Write-Skew anomalies can still happen.
+///
+/// Note that the implementation detects write-write conflicts at the page level granularity so there could
+/// be "false" conflicts in case mutated keys fall within the same Leaf page.
+///
+/// While concurrent write transactions have more individual overhead than exclusive write
+/// transactions, they might be useful in cases like:
+///
+/// * Transactions that run significant amounts of non-database code between database operations and have low conflict chance.
+/// * Transactions that affect disjoint Trees of the Database and thus can run concurrently without conflicts.
+/// * Larger than memory workloads, as it's useful to load relevant parts of the transaction from the disk concurrently, even if there's a conflict risk.
+/// * Random write workloads which have small chances of conflicts and need extra throughput.
 #[derive(Debug, Deref, DerefMut)]
 pub struct WriteTransaction(Transaction);
 
@@ -169,8 +197,12 @@ pub struct Transaction {
     wal_write_batch: RefCell<Option<WriteBatch>>,
     /// Scratch space
     scratch_buffer: RefCell<Vec<u8>>,
-    /// Mutex held by the unique write tx
-    write_lock: Option<ArcMutexGuard<RawMutex, CachedWriteState>>,
+    /// held by the exclusive write tx
+    exclusive_write_lock: Option<ArcRwLockWriteGuard<RawRwLock, ()>>,
+    /// held by a multi writer tx
+    multi_write_lock: Option<ArcRwLockReadGuard<RawRwLock, ()>>,
+    commit_lock: Option<ArcMutexGuard<RawMutex, CachedWriteState>>,
+    tracked_transaction: Option<TxId>,
     /// Handle to the environment, set if this is an user transaction and the Database is open
     env_handle: Option<EnvironmentHandle>,
 }
@@ -178,13 +210,13 @@ pub struct Transaction {
 impl std::fmt::Debug for Transaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Transaction")
-            // .field("inner", &0)
             .field("state", &self.state.get())
             .field("trees", &self.trees)
             .field("nodes", &self.nodes)
             .field("done", &self.flags.get().contains(TF::DONE))
             .field("write_batch", &self.wal_write_batch)
-            .field("write_lock", &self.write_lock.is_some())
+            .field("exclusive_write_lock", &self.exclusive_write_lock.is_some())
+            .field("multi_write_lock", &self.multi_write_lock.is_some())
             .finish()
     }
 }
@@ -267,7 +299,7 @@ impl DatabaseFile {
             .mmap
             .read()
             .as_ref()
-            .map_or(false, |m| m.len() as u64 >= file_len)
+            .is_some_and(|m| m.len() as u64 >= file_len)
         {
             return Ok(());
         }
@@ -352,7 +384,14 @@ struct RunningStats {
 struct OpenTxn {
     tx_id: TxId,
     earliest_snapshot_tx_id: TxId,
-    ref_count: usize,
+    ref_count: u32,
+    writers: u32,
+}
+
+#[derive(Debug, Default)]
+struct FreeBuffers {
+    free: BTreeMap<TxId, Vec<FreePage>>,
+    scan_from: TxId,
 }
 
 struct DatabaseInner {
@@ -373,7 +412,7 @@ struct DatabaseInner {
     /// Page Buffers freed by transactions.
     /// Can be released when they are no longer visible
     /// Map<transaction that freed, Vec<visible from tx (Inc.), buffer idx>>
-    buffers_free: Mutex<BTreeMap<TxId, Vec<FreePage>>>,
+    free_buffers: Mutex<FreeBuffers>,
     /// Map<checkpoint tx, Freelist>.
     /// Note: Freelists may be empty
     /// Doesn't contain the freelist for the latest snapshot (metapage.snapshot_tx_id) nor for
@@ -381,7 +420,9 @@ struct DatabaseInner {
     old_snapshots: Mutex<BTreeMap<TxId, Freelist>>,
     checkpoint_lock: Mutex<()>,
     running_stats: Mutex<RunningStats>,
-    write_lock: StdArc<Mutex<CachedWriteState>>,
+    commit_lock: StdArc<Mutex<CachedWriteState>>,
+
+    write_lock: StdArc<RwLock<()>>,
     /// Open transactions other than the unique write transaction
     /// This is a sorted Vec to avoid hitting the allocator when the collections len fluctuates (0-1-0-1..)
     /// Furthermore, min lookup are push-last are common, which more than make up for small linear removals.
@@ -541,9 +582,9 @@ impl DatabaseRecovery {
                     let tree = Self::get_tree_by_id(&self.tx, &mut trees_by_id, tree_id)?;
                     tree.delete_range(bounds)?;
                 }
-                wb::Operation::CreateTree(name, options) => {
+                wb::Operation::CreateTree(tree_id, name, options) => {
                     trees_by_id.clear();
-                    self.tx.get_or_create_tree_with(&name, options)?;
+                    self.tx.create_tree(tree_id, &name, options)?;
                 }
                 wb::Operation::DeleteTree(name) => {
                     trees_by_id.clear();
@@ -645,9 +686,10 @@ impl Database {
             page_table: Default::default(),
             checkpoint_lock: Default::default(),
             write_lock: Default::default(),
+            commit_lock: Default::default(),
             old_snapshots: Default::default(),
             allocator: Default::default(),
-            buffers_free: Default::default(),
+            free_buffers: Default::default(),
             transactions: Default::default(),
             transactions_condvar: Default::default(),
             running_stats: Default::default(),
@@ -678,7 +720,7 @@ impl Database {
         #[cfg(all(any(fuzzing, test), debug_assertions))]
         db.validate_free_space().unwrap();
         let db_recovery = DatabaseRecovery {
-            tx: Transaction::new_write(&db.inner, false)?,
+            tx: Transaction::new_write(&db.inner, false, false)?,
             db,
             batches_recovered: Default::default(),
             ops_recovered: Default::default(),
@@ -705,7 +747,7 @@ impl Database {
     #[cfg(any(fuzzing, test))]
     pub fn validate_free_space(&self) -> Result<(), Error> {
         let _checkpoint_lock = self.inner.checkpoint_lock.lock();
-        let _write_lock = self.inner.write_lock.lock();
+        let _write_lock = self.inner.write_lock.write();
         // We are using a read tnx to avoid dealing with the write txn reservations.
         // Furthermore, since we're holding checkpoint lock it must be a non-user txn to avoid
         // deadlocks with major operations such as compaction.
@@ -753,10 +795,16 @@ impl Database {
             spans.merge(&freelist_spans).unwrap();
         }
 
-        let main_allocator = self.inner.allocator.lock();
-        spans.merge(&main_allocator.free).unwrap();
+        let mut main_allocator = self.inner.allocator.lock();
+        for (_, free, ind_free) in &main_allocator.pending_free {
+            spans.merge(free).unwrap();
+            indirections.merge(ind_free).unwrap();
+        }
+        spans.merge(main_allocator.free.merged().unwrap()).unwrap();
         let (snapshots_free_left, snapshots_free_right) = main_allocator
             .snapshot_free
+            .merged()
+            .unwrap()
             .clone()
             .split(FIRST_COMPRESSED_PAGE);
         spans.merge(&snapshots_free_left).unwrap();
@@ -771,7 +819,7 @@ impl Database {
         assert_eq!(last.0 + last.1 - 2, spans.len(), "{diff:?}");
 
         indirections
-            .merge(&main_allocator.indirection_free)
+            .merge(main_allocator.indirection_free.merged().unwrap())
             .unwrap();
         let last = indirections
             .last_piece()
@@ -924,27 +972,43 @@ impl Database {
         self.inner.env.wal.sync()
     }
 
-    /// Begins a Write transaction.
-    ///
-    /// Only one active write transaction can be active at a given time (similar to a Mutex).
-    /// This property is automatically enforced by the Database.
-    /// The returned transaction must be committed for the changes to be persisted.
+    /// Begins an Exclusive Write transaction. Equivalent to `begin_write_with(false)`.
+    #[inline]
     pub fn begin_write(&self) -> Result<WriteTransaction, Error> {
-        let mut tx = Transaction::new_write(&self.inner, true)?;
-        tx.release_free_buffers(
-            tx.inner.page_table.spans_used()
-                >= self.inner.opts.throttle_memory_limit / PAGE_SIZE as usize,
-        );
-        if tx.inner.page_table.spans_used()
-            >= self.inner.opts.throttle_memory_limit / PAGE_SIZE as usize
-        {
+        self.begin_write_with(false)
+    }
+
+    /// Begins a Concurrent Write transaction. Equivalent to `begin_write_with(true)`.
+    ///
+    /// See [`WriteTransaction`] for recommendations.
+    #[inline]
+    pub fn begin_write_concurrent(&self) -> Result<WriteTransaction, Error> {
+        self.begin_write_with(true)
+    }
+
+    /// Begins a write transactions
+    ///
+    /// If `concurrent` is true, the returned transaction may run concurrently with other
+    /// _concurrent_ multi write transactions. These transactions run under optimistic concurrency control
+    /// and Snapshot-Isolation (SI), see [`WriteTransaction`] for details.
+    ///
+    /// If `concurrent` is false, then the transactions runs in exclusive mode with Serializable-Snapshot-Isolation (SSI).
+    ///
+    /// Both concurrent modes can be mixed safely. See [`WriteTransaction`] for recommendations.
+    ///  
+    /// The returned transaction must be committed for the changes to be persisted.
+    pub fn begin_write_with(&self, concurrent: bool) -> Result<WriteTransaction, Error> {
+        let throttle_spans = self.inner.opts.throttle_memory_limit / PAGE_SIZE as usize;
+        let mut tx = Transaction::new_write(&self.inner, concurrent, true)?;
+        tx.release_versions(tx.inner.page_table.spans_used() >= throttle_spans);
+        if tx.inner.page_table.spans_used() >= throttle_spans {
             // drop tx to avoid deadlocking with checkpoints
             drop(tx);
             info!("Throttling write tx");
             thread::sleep(Duration::from_micros(100));
-            tx = Transaction::new_write(&self.inner, true)?;
+            tx = Transaction::new_write(&self.inner, concurrent, true)?;
             while {
-                tx.release_free_buffers(true);
+                tx.release_versions(true);
                 tx.inner.page_table.spans_used()
                     >= tx.inner.opts.stall_memory_limit / PAGE_SIZE as usize
             } {
@@ -957,17 +1021,15 @@ impl Database {
                 thread::sleep(Duration::from_micros(100));
                 // Wait for the ongoing checkpoint to finish.
                 self.inner.wait_checkpoint();
-                tx = Transaction::new_write(&self.inner, true)?;
+                tx = Transaction::new_write(&self.inner, concurrent, true)?;
             }
             debug!("Resuming write tx after throttling");
         }
         if tx.inner.opts.use_wal {
             let mut wb = tx
-                .write_lock
+                .commit_lock
                 .as_mut()
-                .unwrap()
-                .wal_write_batch
-                .take()
+                .and_then(|s| s.wal_write_batch.take())
                 .unwrap_or_else(|| WriteBatch::new(self.inner.env.opts.clone()));
             wb.push_db(self.inner.env_db_id)?;
             tx.wal_write_batch = Some(wb).into();
@@ -1014,7 +1076,7 @@ impl Database {
     pub fn compact(&self) -> Result<(), Error> {
         info!("Compacting database {}", self.inner.env_db_name);
         let checkpoint_lock = self.inner.checkpoint_lock.lock();
-        let write_lock = self.inner.write_lock.lock();
+        let write_lock = self.inner.write_lock.write();
         let mut curr_file_size = self.inner.file.file_len();
         // With both checkpoint and write locks we can get a sense of the data file size
         const MIN_SIZE_FOR_COMPACTION: u64 = PAGE_SIZE * 100;
@@ -1029,10 +1091,6 @@ impl Database {
         }
         let mut transactions = self.inner.transactions.lock();
         self.inner.state.lock().block_user_transactions = true;
-        let _reset_compacting = FnTrap::new(|| {
-            self.inner.state.lock().block_user_transactions = false;
-            self.inner.transactions_condvar.notify_all();
-        });
         while !transactions.is_empty() {
             info!("Compaction waiting for read transactions to finish...");
             self.inner.transactions_condvar.wait(&mut transactions);
@@ -1043,6 +1101,12 @@ impl Database {
         drop(checkpoint_lock);
         drop(transactions);
         drop(write_lock);
+
+        let _reset_compacting = FnTrap::new(|| {
+            let _transactions = self.inner.transactions.lock();
+            self.inner.state.lock().block_user_transactions = false;
+            self.inner.transactions_condvar.notify_all();
+        });
 
         info!(
             "Compaction preparing database {}, initial size {}",
@@ -1062,15 +1126,18 @@ impl Database {
                 "Compaction pass {pass}, current size {}",
                 ByteSize(curr_file_size)
             );
-            let mut tx = Transaction::new_write(&self.inner, false)?;
-            let tx_id = tx.tx_id();
-            if let Ok(false) | Err(Error::CantCompact) = tx.compact() {
-                break;
+            let mut tx = Transaction::new_write(&self.inner, false, false)?;
+            match tx.compact() {
+                Ok(true) => (),
+                Ok(false) | Err(Error::CantCompact) => break,
+                Err(e) => return Err(e),
             }
-            if let Err(Error::CantCompact) = tx.commit() {
-                break;
-            }
-            self.checkpoint_internal(Some(tx_id))?;
+            let tx_id = match tx.commit() {
+                Ok(tx_id) => tx_id,
+                Err(Error::CantCompact) => break,
+                Err(e) => return Err(e),
+            };
+            self.checkpoint_internal(Some(tx_id + 1))?;
             // Theoretically one extra checkpoint would be sufficient, but the logic for file shrinking
             // in the allocator is quite limited and depends on the main checkpointer truncating the end.
             for _ in 0..2 {
@@ -1094,10 +1161,9 @@ impl Database {
     fn force_checkpoint(&self) -> Result<(), Error> {
         let mut metapage = self.inner.state.lock().metapage;
         if metapage.tx_id <= metapage.snapshot_tx_id {
-            let tx = Transaction::new_write(&self.inner, false)?;
-            metapage.tx_id = tx.tx_id();
+            let tx = Transaction::new_write(&self.inner, false, false)?;
             tx.mark_dirty();
-            tx.commit()?;
+            metapage.tx_id = tx.commit()?;
         }
         self.checkpoint_internal(Some(metapage.tx_id))
     }
@@ -1123,19 +1189,19 @@ impl WriteTransaction {
         }
         self.delete_tree(new)?;
         self.mark_dirty();
-        let mut old_state = mem::replace(
-            self.trees.borrow_mut().get_mut(old).unwrap(),
-            TreeState::Deleted,
-        );
-        if let TreeState::Available { dirty, .. } = &mut old_state {
+        let mut trees = self.trees.borrow_mut();
+        let mut old_state = trees.get_mut(old).unwrap();
+        let old_value = if let TreeState::Available { dirty, value, .. } = &mut old_state {
             *dirty = true;
+            *value
         } else {
             unreachable!();
-        }
-        let replaced_new_state = self.trees.borrow_mut().insert(new.into(), old_state);
+        };
+        let old_state = mem::replace(old_state, TreeState::Deleted { value: old_value });
+        let replaced_new_state = trees.insert(new.into(), old_state);
         debug_assert!(matches!(
             replaced_new_state,
-            None | Some(TreeState::Deleted)
+            None | Some(TreeState::Deleted { .. })
         ));
         if let Some(batch) = &mut *self.wal_write_batch.borrow_mut() {
             batch.push_rename_tree(old, new)?;
@@ -1154,7 +1220,12 @@ impl WriteTransaction {
             return Ok(false);
         };
         self.mark_dirty();
-        *self.trees.borrow_mut().get_mut(name).unwrap() = TreeState::Deleted;
+        let mut trees = self.trees.borrow_mut();
+        let state = trees.get_mut(name).unwrap();
+        let &mut TreeState::Available { value, .. } = state else {
+            unreachable!();
+        };
+        *state = TreeState::Deleted { value };
         if let Some(batch) = &mut *self.wal_write_batch.borrow_mut() {
             batch.push_delete_tree(name)?;
         }
@@ -1183,51 +1254,62 @@ impl WriteTransaction {
             options.validate_value(&tree.value).guard_trap(guard)?;
             return Ok(tree);
         }
+        self.create_tree(rand::random(), name, options)
+            .guard_trap(guard)
+    }
+
+    fn create_tree(
+        &self,
+        tree_id: TreeId,
+        name: &[u8],
+        options: TreeOptions,
+    ) -> Result<Tree<'_>, Error> {
         self.mark_dirty();
         if let Some(write_batch) = &mut *self.wal_write_batch.borrow_mut() {
-            write_batch.push_create_tree(name, &options.to_bytes())?;
+            write_batch.push_create_tree(&tree_id, name, &options)?;
         }
-        guard.disarm();
         let name: Arc<[u8]> = name.into();
-        let value = options.to_value(self.state.get().metapage.next_tree_id);
+        let value = options.to_value(tree_id);
         self.trees
             .borrow_mut()
             .insert(name.clone(), TreeState::InUse { value });
-        self.state.reset_with(|s| s.metapage.next_tree_id += 1);
         Ok(Tree {
             name: Some(name),
             value,
             tx: self,
+            len_delta: 0,
             dirty: true,
             cached_root: Default::default(),
         })
     }
 
-    /// Commits the transaction
+    /// Commits the transaction. See [Self::commit_with] for details.
     ///
     /// Equivalent to [Self::commit_with] with the sync argument from [DbOptions::default_commit_sync]
     #[inline]
-    pub fn commit(self) -> Result<(), Error> {
+    pub fn commit(self) -> Result<TxId, Error> {
         let sync = self.inner.opts.default_commit_sync;
         self.commit_with(sync)
     }
 
     /// Commits the transaction and optionally performs a durable `fsync` to make the transaction
-    /// (and all the ones before it) durable in the storage.
+    /// (and all the ones before it) durable in the storage. Returns the new TxId.
     ///
-    /// Note that transactions that commiting transactions that aren't dirty (see [WriteTransaction::is_dirty])
-    /// are equivalent to a rollback (nothing is affected, e.g. the next WriteTransaction will have the
-    /// same Transaction Id).
-    pub fn commit_with(mut self, sync: bool) -> Result<(), Error> {
+    /// If this is a concurrent write transaction commit will perform conflict checking and will return
+    /// [`Error::WriteConflict`] in case of conflicts.
+    ///
+    /// Note that transactions that aren't dirty (see [WriteTransaction::is_dirty]) are equivalent
+    /// to a rollback (nothing is affected) and the transaction will return the original TxId.
+    pub fn commit_with(mut self, sync: bool) -> Result<TxId, Error> {
         debug_assert!(self.is_write_tx());
         if !self.is_dirty() {
             trace!("Transaction isn't dirty, commit is a rollback");
-            return self.rollback();
+            return self.0.do_rollback().map(|_| self.tx_id());
         }
         self.0.commit_start()?;
         self.0.commit_wal(sync)?;
         self.0.commit_finish()?;
-        Ok(())
+        Ok(self.tx_id())
     }
 
     /// Rolls back the transaction, discarding any changes
@@ -1252,11 +1334,22 @@ impl WriteTransaction {
         let mut free_space;
         {
             // note that this only usable free space (e.g. not freespace from snapshots)
-            let main_allocator = self.0.inner.allocator.lock();
+            let mut main_allocator = self.0.inner.allocator.lock();
             end_of_file = main_allocator.next_page_id;
-            free_space = main_allocator.free.clone();
+            free_space = main_allocator.free.merged()?.clone();
             free_space.merge(&self.0.allocator.get_mut().free)?;
         }
+        debug!(
+            "Total freespace available {:?}",
+            ByteSize(free_space.len() as u64 * PAGE_SIZE)
+        );
+        for (st, fl) in self.inner.old_snapshots.lock().iter() {
+            debug!(
+                "Snapshot {st} space available {:?}",
+                ByteSize(fl.len() as u64 * PAGE_SIZE)
+            );
+        }
+        debug_assert!(self.inner.allocator.lock().pending_free.is_empty());
         // figure out the amount of data that is moveable using binary search
         let mut lo = 0;
         let mut hi = end_of_file;
@@ -1295,43 +1388,47 @@ impl Drop for Transaction {
         if self.is_write_or_checkpoint_txn() && !self.is_done() {
             let _ = self.do_rollback();
         }
-        if !self.is_write_tx() {
-            let tx_id = self.state.get_mut().metapage.tx_id;
-            let earliest_open_read_tx;
-            let earliest_tx_needed;
-            {
-                let mut transactions = self.inner.transactions.lock();
-                let idx = transactions
-                    .binary_search_by_key(&tx_id, |ot| ot.tx_id)
-                    .expect("missing transaction");
-                let ot = &mut transactions[idx];
-                ot.ref_count -= 1;
-                if ot.ref_count == 0 {
-                    transactions.remove(idx);
-                }
-                earliest_open_read_tx = transactions.first().map(|ot| ot.tx_id);
-                earliest_tx_needed = earliest_open_read_tx.or_else(|| {
-                    // The state read must be done while holding the transactions lock
-                    // to avoid a new read transaction from being created at the same tx-id as this (X) .
-                    // While this drop will drop the transactions lock and reads a _newly_ committed
-                    // tx-id from state (X+1), then proceed to remove the buffers needed by X.
-                    self.inner
-                        .state
-                        .try_lock()
-                        .map(|state| state.metapage.tx_id)
-                });
+        if let Some(tx_id) = self.tracked_transaction {
+            let mut transactions = self.inner.transactions.lock();
+            let idx = transactions
+                .binary_search_by_key(&tx_id, |ot| ot.tx_id)
+                .expect("missing transaction");
+            let ot = &mut transactions[idx];
+            ot.writers -= self.is_multi_write_tx() as u32;
+            ot.ref_count -= 1;
+            let removed_tx = ot.ref_count == 0;
+            if removed_tx {
+                transactions.remove(idx);
             }
-            match earliest_tx_needed {
-                Some(earliest) if earliest > tx_id => {
-                    trace!("Calling release_free_buffers_tail from read tx {tx_id} drop, earliest tx needed {earliest}");
-                    self.release_free_buffers_tail(earliest, false);
-                }
-                _ => (),
-            }
+            let earliest_open_read_tx = transactions.first().map(|ot| ot.tx_id);
+            let earliest_tx_needed = earliest_open_read_tx.or_else(|| {
+                // The state read must be done while holding the transactions lock
+                // to avoid a new read transaction from being created at the same tx-id as this (X) .
+                // While this drop will drop the transactions lock and reads a _newly_ committed
+                // tx-id from state (X+1), then proceed to remove the buffers needed by X.
+                self.inner
+                    .state
+                    .try_lock()
+                    .map(|state| state.metapage.tx_id)
+            });
             if earliest_open_read_tx.is_none() {
                 self.inner.transactions_condvar.notify_all();
             }
+            drop(transactions);
+
+            match earliest_tx_needed {
+                Some(earliest) if earliest > tx_id => {
+                    trace!("Calling release_versions_tail from tx {tx_id} drop, earliest tx needed {earliest}");
+                    self.release_versions_tail(earliest, false);
+                }
+                _ if removed_tx => {
+                    let mut free_buffers = self.inner.free_buffers.lock();
+                    free_buffers.scan_from = free_buffers.scan_from.min(tx_id);
+                }
+                _ => (),
+            }
         }
+
         // This txn might be the last strong database reference and thus last env reference
         let _maybe_last_env = self.env_handle.take().and_then(|env_handle| {
             // 1 ref here and 1 ref in the bg thread
@@ -1352,42 +1449,96 @@ impl Drop for Transaction {
 }
 
 impl Transaction {
-    fn new_write(inner: &SharedDatabaseInner, user_txn: bool) -> Result<WriteTransaction, Error> {
-        let mut write_lock;
+    fn new_write(
+        inner: &SharedDatabaseInner,
+        multi: bool,
+        user_txn: bool,
+    ) -> Result<WriteTransaction, Error> {
+        let mut exclusive_write_lock = None;
+        let mut multi_write_lock = None;
+        let mut transactions;
         let mut state;
+        let mut waited = false;
         loop {
-            write_lock = Mutex::lock_arc(&inner.write_lock);
+            if multi {
+                multi_write_lock = Some(inner.write_lock.read_arc());
+            } else {
+                exclusive_write_lock = Some(inner.write_lock.write_arc());
+            }
+            transactions = inner.transactions.lock();
             state = *inner.state.lock();
             state.check_halted()?;
             if !user_txn || !state.block_user_transactions {
+                if waited {
+                    debug!("new_write resuming after user_transactions are allowed");
+                }
                 break;
             }
-            drop(write_lock);
+            exclusive_write_lock = None;
+            multi_write_lock = None;
             debug!("new_write waiting for user_transactions to be allowed");
-            inner
-                .transactions_condvar
-                .wait(&mut inner.transactions.lock());
+            waited = true;
+            inner.transactions_condvar.wait(&mut transactions);
+            drop(transactions);
         }
-        state.metapage.tx_id += 1;
-        trace!("new_write {}", state.metapage.tx_id);
-        let allocator = Allocator::new_transaction(inner)?;
-        let nodes = write_lock
-            .nodes
-            .take()
-            .unwrap_or_else(|| new_dirty_cache(&inner.opts));
-        let trees = write_lock.trees.take().unwrap_or_default();
+        let trees;
+        let nodes;
+        let scratch_buffer;
+        let tracked_transaction;
+        let flags;
+        let commit_lock = if multi {
+            match transactions.last_mut() {
+                Some(l) if l.tx_id == state.metapage.tx_id => {
+                    l.ref_count += 1;
+                    l.writers += 1;
+                }
+                _ => {
+                    transactions.push(OpenTxn {
+                        tx_id: state.metapage.tx_id,
+                        ref_count: 1,
+                        writers: 1,
+                        earliest_snapshot_tx_id: state.metapage.snapshot_tx_id,
+                    });
+                }
+            }
+            drop(transactions);
+            tracked_transaction = Some(state.metapage.tx_id);
+            flags = TF::WRITE_TX | TF::MULTI_WRITE_TX;
+            trees = None;
+            nodes = None;
+            scratch_buffer = Default::default();
+            None
+        } else {
+            drop(transactions);
+            tracked_transaction = None;
+            flags = TF::WRITE_TX;
+            let mut commit_lock = inner.commit_lock.lock_arc();
+            trees = commit_lock.trees.take();
+            nodes = commit_lock.nodes.take();
+            scratch_buffer = mem::take(&mut commit_lock.scratch_buffer);
+            Some(commit_lock)
+        };
+        trace!(
+            "new_write {} multi {multi:?} user {user_txn:?}",
+            state.metapage.tx_id
+        );
+        let allocator =
+            Allocator::new_transaction(inner, !multi && state.ongoing_snapshot_tx_id.is_none())?;
         Ok(WriteTransaction(Transaction {
-            flags: TF::WRITE_TX.into(),
+            flags: Cell::new(flags),
             trap: Default::default(),
             allocator: RefCell::new(allocator),
             inner: ManuallyDrop::new(inner.clone()),
             state: Cell::new(state),
-            trees: RefCell::new(trees),
-            nodes: RefCell::new(nodes),
+            trees: RefCell::new(trees.unwrap_or_default()),
+            nodes: RefCell::new(nodes.unwrap_or_else(|| new_dirty_cache(&inner.opts))),
+            scratch_buffer: RefCell::new(scratch_buffer),
+            tracked_transaction,
             nodes_spilled_span: Default::default(),
             wal_write_batch: Default::default(),
-            scratch_buffer: RefCell::new(mem::take(&mut write_lock.scratch_buffer)),
-            write_lock: Some(write_lock),
+            exclusive_write_lock,
+            multi_write_lock,
+            commit_lock,
             env_handle: user_txn.then(|| inner.open.lock().clone()).flatten(),
         }))
     }
@@ -1401,21 +1552,26 @@ impl Transaction {
         // * for this state acquisition to not notice the state.block_user_transactions which is updated
         // while holding all locks (inc. transactions).
         let mut transactions = inner.transactions.lock();
+        let mut waited = false;
         loop {
             state = *inner.state.lock();
             if !user_txn || !state.block_user_transactions {
+                if waited {
+                    debug!("new_write resuming after user_transactions are allowed");
+                }
                 break;
             }
             debug!("new_read waiting for user_transactions to be allowed");
+            waited = true;
             inner.transactions_condvar.wait(&mut transactions);
         }
-        match transactions.binary_search_by_key(&state.metapage.tx_id, |ot| ot.tx_id) {
-            Ok(idx) => transactions[idx].ref_count += 1,
-            Err(idx) => {
-                debug_assert_eq!(idx, transactions.len());
+        match transactions.last_mut() {
+            Some(l) if l.tx_id == state.metapage.tx_id => l.ref_count += 1,
+            _ => {
                 transactions.push(OpenTxn {
                     tx_id: state.metapage.tx_id,
                     ref_count: 1,
+                    writers: 0,
                     earliest_snapshot_tx_id: state.metapage.snapshot_tx_id,
                 });
             }
@@ -1431,7 +1587,10 @@ impl Transaction {
             nodes: RefCell::new(void_dirty_cache()),
             nodes_spilled_span: Default::default(),
             wal_write_batch: None.into(),
-            write_lock: None,
+            exclusive_write_lock: None,
+            multi_write_lock: None,
+            commit_lock: None,
+            tracked_transaction: Some(state.metapage.tx_id),
             allocator: RefCell::new(Allocator::default()),
             scratch_buffer: Default::default(),
             env_handle: user_txn.then(|| inner.open.lock().clone()).flatten(),
@@ -1457,6 +1616,7 @@ impl Transaction {
             name: Default::default(),
             value: self.state.get().metapage.trees_tree,
             tx: self,
+            len_delta: 0,
             dirty: false,
             cached_root: Default::default(),
         }
@@ -1467,6 +1627,7 @@ impl Transaction {
             name: Default::default(),
             value: self.state.get().metapage.indirections_tree,
             tx: self,
+            len_delta: 0,
             dirty: false,
             cached_root: Default::default(),
         }
@@ -1784,64 +1945,59 @@ impl Transaction {
         )
     }
 
-    fn free_clean_page_buffer_and_snapshot(
+    fn free_snapshot_page(
         &self,
         allocator: &mut Allocator,
         page_id: PageId,
         span: PageId,
         compressed_page: Option<(PageId, PageId)>,
-    ) -> Result<bool, Error> {
-        trace!("free_clean_page_buffer_and_snapshot {page_id} ({span}) {compressed_page:?}");
+    ) -> Result<(), Error> {
+        trace!("free_snapshot_page {page_id} ({span}) {compressed_page:?}");
         let tx_id = self.tx_id();
         let ongoing_snapshot_tx_id = self.state.get().ongoing_snapshot_tx_id;
-        let (target, redirected) = match self
-            .inner
-            .page_table
-            .insert_w_shadowed(tx_id, page_id, None)
-        {
-            Some((from, Item::Page(_))) => {
-                allocator.buffer_free.push(FreePage(from, page_id));
-                if ongoing_snapshot_tx_id.map_or(false, |ockp| from <= ockp) {
-                    (Some(&mut allocator.next_snapshot_free), None)
-                } else {
-                    (None, None)
-                }
+        let is_multi_write = self.is_multi_write_tx();
+        let shadowed =
+            self.inner
+                .page_table
+                .insert_w_shadowed(tx_id, page_id, None, is_multi_write);
+        let (target, redirected) = match shadowed {
+            Some((_from, Item::Page(_))) => {
+                // since this was already determined to be a checkpoint page it can only be for
+                // the ongoing checkpoint.
+                (&mut allocator.next_snapshot_free, None)
             }
             Some((from, Item::Redirected(c_pid, c_span, r_latest))) => {
+                // buffer free handled by checkpointer
                 debug_assert!(r_latest);
                 debug_assert!(page_id.is_compressed());
-                let target = if ongoing_snapshot_tx_id.map_or(false, |ockp| from <= ockp) {
+                let target = if ongoing_snapshot_tx_id.is_some_and(|ockp| from <= ockp) {
                     &mut allocator.next_snapshot_free
                 } else {
                     &mut allocator.snapshot_free
                 };
-                (Some(target), Some((c_pid, c_span)))
+                (target, Some((c_pid, c_span)))
             }
-            None => (Some(&mut allocator.snapshot_free), None),
+            None => {
+                if is_multi_write {
+                    allocator.buffer_free.push(FreePage(tx_id, page_id));
+                }
+                (&mut allocator.snapshot_free, None)
+            }
         };
 
         if page_id.is_compressed() {
             if compressed_page.is_some() && redirected.is_some() {
-                assert_eq!(compressed_page, redirected);
+                debug_assert_eq!(compressed_page, redirected);
+            }
+            target.free(page_id, 1)?;
+            if let Some((c_pid, c_span)) = compressed_page.or(redirected) {
+                target.free(c_pid, c_span)?;
             }
         } else {
-            assert_eq!(compressed_page, None);
-            assert_eq!(redirected, None);
+            debug_assert_eq!(compressed_page.or(redirected), None);
+            target.free(page_id, span)?;
         }
-
-        if let Some(target) = target {
-            if page_id.is_compressed() {
-                target.free(page_id, 1)?;
-                if let Some((c_pid, c_span)) = compressed_page.or(redirected) {
-                    target.free(c_pid, c_span)?;
-                }
-            } else {
-                target.free(page_id, span)?;
-            }
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        Ok(())
     }
 
     #[inline]
@@ -1880,12 +2036,11 @@ impl Transaction {
                 },
             );
             self.spill_dirty_nodes(spilled)?;
-            let new_id = self.allocate_page_id(
+            node_mut.node_header_mut().page_header.id = self.allocate_page_id(
                 &mut self.allocator.borrow_mut(),
                 node_mut.span(),
                 node_mut.id().is_compressed(),
             )?;
-            node_mut.node_header_mut().page_header.id = new_id;
         }
 
         let spilled = self
@@ -2026,8 +2181,8 @@ impl Transaction {
         trace!("Rolling back txn {}", self.tx_id());
         // failures after setting DONE are fatal
         self.flags.get_mut().insert(TF::DONE);
-        if self.is_dirty() && self.is_write_tx() {
-            // if we failed in commit dirty we may have cleanup to do here
+        // if we failed in commit dirty we may have cleanup to do here
+        if self.flags.get_mut().contains(TF::PAGE_TABLE_DIRTY) {
             self.inner.page_table.clear_latest_tx(self.tx_id());
         }
         // even if it's clean it may have reservations
@@ -2042,41 +2197,40 @@ impl Transaction {
     }
 
     fn commit_dirty_nodes(&mut self) -> Result<(), Error> {
+        self.flags.get_mut().insert(TF::PAGE_TABLE_DIRTY);
         let tx_id = self.tx_id();
+        let is_multi_write = self.is_multi_write_tx();
         let mut nodes = self.nodes.borrow_mut();
         let allocator = &mut self.allocator.borrow_mut();
         allocator.buffer_free.reserve_exact(nodes.len());
         for (page_id, node) in nodes.drain() {
-            match node {
+            let shadowed = match node {
                 TxNode::Stashed(node) => {
                     trace!("commit_dirty_nodes insert {}", node.id());
                     debug_assert!(node.dirty);
                     debug_assert!(node.num_keys() != 0, "Invalid node {node:#?}");
                     let mut page = node.into_page();
                     page.dirty = false;
-                    let shadowed = self
-                        .inner
+                    self.inner
                         .page_table
-                        .insert(tx_id, page.id(), Item::Page(page));
-                    if let Some(from) = shadowed {
-                        allocator.buffer_free.push(FreePage(from, page_id));
-                    }
+                        .insert(tx_id, page.id(), Item::Page(page), false)
                 }
                 TxNode::Spilled {
                     compressed_page, ..
                 } => {
                     trace!("commit_dirty_nodes spilled {page_id}");
-                    let shadowed = if let Some((c_pid, c_span)) = compressed_page {
+                    if let Some((c_pid, c_span)) = compressed_page {
                         self.inner.page_table.insert(
                             tx_id,
                             page_id,
                             Item::Redirected(c_pid, c_span, true),
+                            false,
                         )
                     } else {
-                        self.inner.page_table.insert(tx_id, page_id, None)
-                    };
-                    if let Some(from) = shadowed {
-                        allocator.buffer_free.push(FreePage(from, page_id));
+                        self.inner
+                            .page_table
+                            .insert(tx_id, page_id, None, is_multi_write)
+                            .or(is_multi_write.then_some(tx_id))
                     }
                 }
                 TxNode::Freed {
@@ -2086,38 +2240,51 @@ impl Transaction {
                 } => {
                     trace!("commit_dirty_nodes freed {page_id}");
                     if from_snapshot {
-                        self.free_clean_page_buffer_and_snapshot(
-                            allocator,
-                            page_id,
-                            span,
-                            compressed_page,
-                        )?;
+                        self.free_snapshot_page(allocator, page_id, span, compressed_page)?;
+                        None
                     } else {
-                        let shadowed = self.inner.page_table.insert(tx_id, page_id, None);
-                        if let Some(from) = shadowed {
-                            allocator.buffer_free.push(FreePage(from, page_id));
-                        }
+                        self.inner
+                            .page_table
+                            .insert(tx_id, page_id, None, is_multi_write)
+                            .or(is_multi_write.then_some(tx_id))
                     }
                 }
                 TxNode::Popped(..) => unreachable!("page {page_id} isn't stashed"),
+            };
+            if let Some(from) = shadowed {
+                allocator.buffer_free.push(FreePage(from, page_id));
             }
         }
         Ok(())
     }
 
-    /// Releases all buffers from transactions <= earliest_tx
-    fn release_free_buffers_tail(&self, earliest_tx: TxId, can_block: bool) {
-        trace!("release_free_buffers_tail earliest_tx {earliest_tx} can_block {can_block:?}");
+    /// Releases all buffers and pending free pages from transactions <= earliest_tx
+    fn release_versions_tail(&self, earliest_tx: TxId, can_block: bool) {
+        trace!("release_versions_tail earliest_tx {earliest_tx} can_block {can_block:?}");
+        {
+            let mut main = self.inner.allocator.lock();
+            let main = &mut *main;
+            let to_drain_count = main
+                .pending_free
+                .iter()
+                .take_while(|(t, ..)| *t <= earliest_tx)
+                .count();
+            for (_, free, ind_free) in main.pending_free.drain(..to_drain_count) {
+                main.free.append(free);
+                main.indirection_free.append(ind_free);
+            }
+        }
+
         let mut released = SmallVec::<_, 3>::new();
         {
-            let mut buffers_free = if can_block {
-                self.inner.buffers_free.lock()
-            } else if let Some(guard) = self.inner.buffers_free.try_lock() {
+            let mut free_buffers = if can_block {
+                self.inner.free_buffers.lock()
+            } else if let Some(guard) = self.inner.free_buffers.try_lock() {
                 guard
             } else {
                 return;
             };
-            while let Some(pending) = buffers_free.first_entry() {
+            while let Some(pending) = free_buffers.free.first_entry() {
                 if *pending.key() <= earliest_tx {
                     released.push((*pending.key(), pending.remove()));
                 } else {
@@ -2136,67 +2303,78 @@ impl Transaction {
         }
     }
 
-    fn release_free_buffers(&self, agressive: bool) {
-        trace!("release_free_buffers agressive {agressive:?}");
+    fn release_versions(&self, agressive: bool) {
+        trace!("release_versions agressive {agressive:?}");
         debug_assert!(self.is_write_tx());
 
-        let prev_tx_id = self.tx_id() - 1;
+        let mut earliest_tx_needed = self.tx_id();
         // Drop of old Read/Checkpoint transactions is responsible for
         // tail cleanup, we only have to attempt it here if there aren't any.
-        if self.inner.transactions.lock().is_empty() {
-            self.release_free_buffers_tail(prev_tx_id, agressive);
+        if !self.is_multi_write_tx() && self.inner.transactions.lock().is_empty() {
+            self.release_versions_tail(earliest_tx_needed, agressive);
         }
 
         if !agressive {
             return;
         }
-        let mut emptied = SmallVec::<TxId, 15>::new();
-        let transactions = self.inner.transactions.lock();
-        let mut buffers_free = self.inner.buffers_free.lock();
-        let mut transactions_iter = transactions.iter().map(|ot| ot.tx_id).peekable();
-        let mut previous_tx_id = 0;
-        for (&releasing_tx_id, pending) in buffers_free.iter_mut() {
-            if releasing_tx_id >= prev_tx_id {
+        let mut to_free = SmallVec::<FreePage, 15>::new();
+        let mut emptied = SmallVec::<TxId, 7>::new();
+        let locked_transactions = self.inner.transactions.lock();
+        let mut open_transactions =
+            SmallVec::<TxId, 12>::from_iter(locked_transactions.iter().map(|ot| ot.tx_id))
+                .into_iter()
+                .peekable();
+        if self.is_multi_write_tx() {
+            earliest_tx_needed = locked_transactions
+                .iter()
+                .find_map(|ot| (ot.writers != 0).then_some(ot.tx_id))
+                .unwrap_or(earliest_tx_needed);
+        }
+        drop(locked_transactions);
+        // Last open tx <= releasing_tx_id
+        let mut last_open_tx_lte = 0;
+        let mut locked_free_buffers = self.inner.free_buffers.lock();
+        let free_buffers = &mut *locked_free_buffers;
+        for (&releasing_tx_id, pending) in free_buffers.free.range_mut(free_buffers.scan_from..) {
+            if releasing_tx_id > earliest_tx_needed {
                 break;
             }
-            while let Some(&t) = transactions_iter.peek() {
+            while let Some(&t) = open_transactions.peek() {
                 if t <= releasing_tx_id {
-                    previous_tx_id = t;
-                    transactions_iter.next();
+                    last_open_tx_lte = t;
+                    open_transactions.next();
                 } else {
                     break;
                 }
             }
-            // visible_from inside pending is `< releasing_tx_id` and can be removed if `visible_from > previous_tx_id`.
+            // visible_from inside pending is <= releasing_tx_id and can be removed if `visible_from > last_open_tx`.
             // Thus the buffer can be removed if `visible_from` is between `previous_tx_id(ex) and releasing_tx_id(ex)`.
             // We can detect if that range is empty and bail early.
-            if previous_tx_id + 1 >= releasing_tx_id {
+            if last_open_tx_lte + 1 >= releasing_tx_id {
                 continue;
             }
-            let early_free = utils::vec_drain_if(pending, |&FreePage(visible_from, _)| {
-                visible_from > previous_tx_id
-            });
-            for FreePage(from_tx_id, page_id) in early_free {
-                self.inner.page_table.remove_at(from_tx_id, page_id);
-            }
+            to_free.extend(utils::vec_drain_if(
+                pending,
+                |&FreePage(visible_from, _)| visible_from > last_open_tx_lte,
+            ));
             if pending.is_empty() {
                 emptied.push(releasing_tx_id);
             }
         }
-        drop(transactions);
         for releasing_tx_id in emptied {
-            buffers_free.remove(&releasing_tx_id);
+            free_buffers.free.remove(&releasing_tx_id);
+        }
+        free_buffers.scan_from = earliest_tx_needed + 1;
+        drop(locked_free_buffers);
+        for FreePage(from_tx_id, page_id) in to_free {
+            self.inner.page_table.remove_at(from_tx_id, page_id);
         }
     }
 
-    /// The Id of this transaction
+    /// The _original_ Id of this transaction
     ///
-    /// For a read-only transaction, this corresponds to the snapshot being read and reflects a
-    /// write transaction at the time it was committed.
-    ///
-    /// For write transactions this is a new monotonically increasing transaction Id.
-    /// Note that transactions that roll back (or are committed not dirty (see [WriteTransaction::is_dirty])
-    /// are also treated as rollbacks.
+    /// This corresponds to the starting state of the transaction and corresponds to the last
+    /// committed transaction at the time this transaction started.
     pub fn tx_id(&self) -> TxId {
         self.state.get().metapage.tx_id
     }
@@ -2213,6 +2391,10 @@ impl Transaction {
         self.flags.get().contains(TF::WRITE_TX)
     }
 
+    fn is_multi_write_tx(&self) -> bool {
+        self.flags.get().contains(TF::MULTI_WRITE_TX)
+    }
+
     fn is_done(&self) -> bool {
         self.flags.get().contains(TF::DONE)
     }
@@ -2223,27 +2405,129 @@ impl Transaction {
             .intersects(TF::CHECKPOINT_TX | TF::WRITE_TX)
     }
 
+    fn check_conflicts(&mut self) -> bool {
+        debug_assert!(self.is_multi_write_tx());
+        debug_assert_eq!(self.tracked_transaction, Some(self.tx_id()));
+        let base_tx_id = self.tx_id();
+        for (&page_id, _) in self.nodes.get_mut().iter() {
+            if !self
+                .inner
+                .page_table
+                .is_latest_from_lte(base_tx_id, page_id)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     fn commit_start(&mut self) -> Result<(), Error> {
         debug_assert!(self.is_write_tx());
-        trace!("Commit start {}", self.state.get_mut().metapage.tx_id);
+        let mut check_conflicts = false;
+        let old_tx_id = self.state.get_mut().metapage.tx_id;
+        if self.is_multi_write_tx() {
+            trace!(
+                "MultiWrite Commit start {}",
+                self.state.get_mut().metapage.tx_id
+            );
+            self.commit_lock = Some(self.inner.commit_lock.lock_arc());
+            let latest_state = *self.inner.state.lock();
+            latest_state.check_halted()?;
+            if self.tx_id() != latest_state.metapage.tx_id {
+                if self.check_conflicts() {
+                    return Err(Error::WriteConflict);
+                }
+                self.state.get_mut().metapage = latest_state.metapage;
+                check_conflicts = true;
+            }
+        }
+        self.state.get_mut().metapage.tx_id += 1;
+        trace!(
+            "Commit start {old_tx_id} -> {}",
+            self.state.get_mut().metapage.tx_id
+        );
         self.trap.check()?;
-
+        // Commit the dirty trees but also leave it in a clean state in case we end up caching it later
         let mut tx_trees = mem::take(self.trees.get_mut());
         let mut trees_tree = self.get_trees_tree();
-        for (tree_id, tree_state) in &mut tx_trees {
-            match tree_state {
-                TreeState::Available { value, dirty } => {
-                    if *dirty {
-                        *dirty = false;
-                        // TODO: this increases cpu usage significantly for small transactions
-                        trees_tree.insert(tree_id, value.as_bytes())?;
-                    }
+        let mut had_clean = false;
+
+        let cached_trees = self.commit_lock.as_ref().unwrap().trees.as_ref();
+        let get_existing_tree_value =
+            |trees_tree: &Tree<'_>, tree_name: &[u8]| -> Result<Option<TreeValue>, Error> {
+                if let Some(TreeState::Available { value, .. }) =
+                    cached_trees.and_then(|t| t.get(tree_name))
+                {
+                    return Ok(Some(*value));
                 }
-                TreeState::Deleted => {
-                    trees_tree.delete(tree_id)?;
+                Ok(trees_tree.get(tree_name)?.map(|v| {
+                    *Ref::<_, TreeValue>::new_unaligned(v.as_ref())
+                        .unwrap()
+                        .into_ref()
+                }))
+            };
+
+        for (tree_name, tree_state) in &mut tx_trees {
+            match tree_state {
+                TreeState::Available { dirty: false, .. } => {
+                    had_clean = true;
+                }
+                TreeState::Available {
+                    value,
+                    dirty,
+                    len_delta,
+                } if !check_conflicts => {
+                    trees_tree.insert(tree_name, value.as_bytes())?;
+                    *dirty = false;
+                    *len_delta = 0;
+                }
+                TreeState::Available {
+                    value,
+                    dirty,
+                    len_delta,
+                } => {
+                    let existing = get_existing_tree_value(&trees_tree, tree_name)?;
+                    let mut merged = existing.unwrap_or(*value);
+                    let needs_update;
+                    if existing.is_some() {
+                        if merged.id != value.id {
+                            return Err(Error::WriteConflict);
+                        }
+                        if merged.root != PageId::default() && merged.root != value.root {
+                            return Err(Error::WriteConflict);
+                        }
+                        needs_update = merged.root != value.root
+                            || merged.level != value.level
+                            || *len_delta != 0;
+                        merged.root = value.root;
+                        merged.level = value.level;
+                        merged.num_keys = merged.num_keys.wrapping_add_signed(*len_delta);
+                    } else {
+                        needs_update = true;
+                    }
+                    if needs_update {
+                        *value = merged;
+                        trees_tree.insert(tree_name, value.as_bytes())?;
+                    }
+                    *dirty = false;
+                    *len_delta = 0;
+                }
+                TreeState::Deleted { value } => {
+                    if check_conflicts {
+                        if let Some(existing) = get_existing_tree_value(&trees_tree, tree_name)? {
+                            if existing.id != value.id {
+                                return Err(Error::WriteConflict);
+                            }
+                        }
+                    }
+                    trees_tree.delete(tree_name)?;
                 }
                 TreeState::InUse { .. } => unreachable!(),
             }
+        }
+        // clean trees could be outdated, so we won't leave anything for caching
+        if had_clean && check_conflicts {
+            tx_trees.clear();
         }
         let trees_value = trees_tree.value;
         drop(trees_tree);
@@ -2291,14 +2575,31 @@ impl Transaction {
         // Any failures after setting DONE are fatal
         self.flags.get_mut().insert(TF::DONE);
         {
+            let tx_id = self.tx_id();
+            let is_multi_write_tx = self.is_multi_write_tx();
             let allocator = self.allocator.get_mut();
+            if is_multi_write_tx {
+                let mut new_free = allocator.free.clone();
+                new_free.subtract(&allocator.all_allocations);
+                allocator.free.subtract(&new_free);
+                let mut new_ind_free = allocator.indirection_free.clone();
+                new_ind_free.subtract(&allocator.all_allocations);
+                allocator.indirection_free.subtract(&new_ind_free);
+                if !new_free.is_empty() || !new_ind_free.is_empty() {
+                    self.inner
+                        .allocator
+                        .lock()
+                        .pending_free
+                        .push((tx_id, new_free, new_ind_free));
+                }
+            }
             if let Err(e) = allocator.commit() {
                 error!("Commiting allocator error: {e}");
                 self.inner.halt();
                 return Err(e);
             }
-            let mut buffers_free = self.inner.buffers_free.lock();
-            match buffers_free.entry(self.state.get_mut().metapage.tx_id) {
+            let mut free_buffers = self.inner.free_buffers.lock();
+            match free_buffers.free.entry(self.state.get_mut().metapage.tx_id) {
                 btree_map::Entry::Vacant(v) => {
                     v.insert(mem::take(&mut allocator.buffer_free));
                 }
@@ -2316,9 +2617,8 @@ impl Transaction {
             state.spilled_total_span += self.nodes_spilled_span.get();
         }
 
-        {
+        if let Some(mut write_lock) = self.commit_lock.take() {
             // Release write lock and move the write state into it
-            let mut write_lock = self.write_lock.take().unwrap();
             // TODO: consider limiting the size of some of these
             write_lock.nodes = Some(mem::replace(self.nodes.get_mut(), void_dirty_cache()));
             write_lock.trees = Some(mem::take(self.trees.get_mut()));
@@ -2328,6 +2628,8 @@ impl Transaction {
                 wb
             });
         }
+        self.multi_write_lock = None;
+        self.exclusive_write_lock = None;
 
         if self.nodes_spilled_span.get() != 0 {
             self.inner
@@ -2335,7 +2637,7 @@ impl Transaction {
         } else if self.inner.page_table.spans_used()
             >= self.inner.opts.checkpoint_target_size / PAGE_SIZE as usize
         {
-            self.release_free_buffers(true);
+            self.release_versions(true);
             let spans_used = self.inner.page_table.spans_used();
             if spans_used >= self.inner.opts.checkpoint_target_size / PAGE_SIZE as usize
                 && self.inner.checkpoint_queue.is_empty()
@@ -2364,38 +2666,38 @@ impl Transaction {
     fn get_tree_by_id(&self, id: TreeId) -> Result<Option<Tree<'_>>, Error> {
         for (name, state) in self.trees.borrow_mut().iter_mut() {
             match *state {
-                TreeState::Available { value, dirty } if value.id == id => {
+                TreeState::Available {
+                    value,
+                    dirty,
+                    len_delta,
+                } if value.id == id => {
                     *state = TreeState::InUse { value };
                     return Ok(Some(Tree {
                         name: Some(name.clone()),
                         value,
                         tx: self,
                         dirty,
+                        len_delta,
                         cached_root: Default::default(),
                     }));
                 }
                 TreeState::InUse { value } if value.id == id => {
                     return Err(Error::TreeAlreadyOpen(format!("<id: {id}>").into()));
                 }
-                TreeState::Deleted | TreeState::Available { .. } | TreeState::InUse { .. } => (),
+                TreeState::Deleted { .. }
+                | TreeState::Available { .. }
+                | TreeState::InUse { .. } => (),
             }
         }
 
         let guard = self.trap.setup()?;
-        let trees = self.get_trees_tree();
-        let mut cursor = trees.cursor();
-        cursor.first()?;
-        while let Some((k, v)) = cursor.peek()? {
-            let value = *Ref::<_, TreeValue>::new_unaligned(v).unwrap().into_ref();
+        for result in self.get_trees_tree().iter()? {
+            let (k, v) = result?;
+            let value = *Ref::<_, TreeValue>::new_unaligned(v.as_ref())
+                .unwrap()
+                .into_ref();
             if value.id == id {
-                let k = k.to_owned();
-                drop(cursor);
-                drop(trees);
                 return self.get_tree_internal(&k).guard_trap(guard);
-            }
-
-            if !cursor.next()? {
-                break;
             }
         }
         guard.disarm();
@@ -2411,17 +2713,22 @@ impl Transaction {
                 self.trees.borrow_mut().entry_ref(name)
             {
                 match *o.get() {
-                    TreeState::Available { value, dirty } => {
+                    TreeState::Available {
+                        value,
+                        dirty,
+                        len_delta,
+                    } => {
                         *o.get_mut() = TreeState::InUse { value };
                         return Ok(Some(Tree {
                             name: Some(o.key().clone()),
                             value,
                             tx: self,
                             dirty,
+                            len_delta,
                             cached_root: Default::default(),
                         }));
                     }
-                    TreeState::Deleted => {
+                    TreeState::Deleted { .. } => {
                         return Ok(None);
                     }
                     TreeState::InUse { .. } => {
@@ -2446,6 +2753,7 @@ impl Transaction {
                 value,
                 tx: self,
                 dirty: false,
+                len_delta: 0,
                 cached_root: Default::default(),
             }))
         } else {
@@ -2791,7 +3099,7 @@ impl DatabaseInner {
         let compressed_page_id = allocator.allocate(compressed_span)?;
 
         trace!(
-            "Compressing page {} into {}. Compression ratio {:.2}x effective {:.2}x {} -> {} pages",
+            "Compressing page {} -> {}, ratio {:.2}x, effective {:.2}x, {} -> {} pages",
             page.id(),
             compressed_page_id,
             page.raw_data.len() as f64 / compressed_len as f64,
@@ -2847,8 +3155,8 @@ impl DatabaseInner {
                     snapshot_id,
                 );
                 let mut allocator = self.allocator.lock();
-                allocator.free.merge(&left)?;
-                allocator.indirection_free.merge(&right)?;
+                allocator.free.merged()?.merge(&left)?;
+                allocator.indirection_free.merged()?.merge(&right)?;
             } else {
                 break;
             }
@@ -3000,7 +3308,7 @@ impl DatabaseInner {
             }
             CheckpointReason::WalSize(min_wal_tail) => {
                 let cur_wal_tail = inner.wal_tail();
-                if cur_wal_tail.map_or(true, |w| w > min_wal_tail) {
+                if cur_wal_tail.is_none_or(|w| w > min_wal_tail) {
                     debug!("Ignoring checkpoint request {reason:?}, tail is {cur_wal_tail:?}");
                     return Ok(0);
                 }
@@ -3012,7 +3320,7 @@ impl DatabaseInner {
 
         let result = (|| -> Result<Option<WriteTransaction>, Error> {
             debug!("Acquiring checkpoint start write lock");
-            let write_lock = inner.write_lock.lock();
+            let write_lock = inner.write_lock.write();
             let mut txn = Transaction::new_read(inner, false)?;
             let txn_state = txn.state.get();
             txn_state.check_halted()?;
@@ -3060,7 +3368,7 @@ impl DatabaseInner {
             );
             // TODO: maybe reserve half of free on start? to avoid this in some cases?
             debug!("Acquiring checkpoint reservation write lock");
-            let _write_lock = inner.write_lock.lock();
+            let _write_lock = inner.write_lock.write();
             txn.0
                 .allocator
                 .get_mut()
@@ -3194,14 +3502,15 @@ impl DatabaseInner {
 
         debug!("Acquiring checkpoint end write lock");
         {
-            let _w = inner.write_lock.lock();
+            let _write_lock = inner.write_lock.write();
             let mut state = inner.state.lock();
 
             // Redirected buffer pages must be freed at the _next_ tx as this tx
             // may already have read transactions w/o the new indirection map.
             inner
-                .buffers_free
+                .free_buffers
                 .lock()
+                .free
                 .insert(state.metapage.tx_id + 1, checkpoint.redirected_buffers);
             state.metapage.page_header.id = new_metapage.page_header.id;
             state.metapage.snapshot_tx_id = snapshot_tx_id;
@@ -3226,7 +3535,7 @@ impl DatabaseInner {
             inner
                 .old_snapshots
                 .lock()
-                .insert(snapshot_tx_id, snapshot_free);
+                .insert(snapshot_tx_id, snapshot_free.into_merged().expect("TODO"));
             // which in turn might release old snapshots
             if let Err(e) = inner.release_old_snapshots(snapshot_tx_id) {
                 error!("Error releasing snapshot freelist: {e}");
@@ -3236,7 +3545,7 @@ impl DatabaseInner {
 
             // The checkpoint allocator is committed, older snapshts are released (if possible),
             // and we're holding the write lock. So it's a good opportunity to truncate the freelists.
-            inner.allocator.lock().truncate_end();
+            inner.allocator.lock().truncate_end().expect("TODO");
         }
         // We are not tracking the file size of all snapshots in use, so we could pick the max.
         // So it's only really safe if the earliest tx is using the latest snapshot.
@@ -3522,7 +3831,8 @@ type DirtyNodes = quick_cache::unsync::Cache<
     PageId,
     TxNode,
     DirtyNodeWeighter,
-    foldhash::fast::RandomState,
+    // Using quality for the time being to avoid degenerate cases https://github.com/rust-lang/hashbrown/issues/577
+    foldhash::quality::RandomState,
     DirtyNodeLifecycle,
 >;
 

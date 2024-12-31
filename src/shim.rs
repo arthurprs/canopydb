@@ -128,62 +128,144 @@ pub mod parking_lot {
         }
     }
 
-    #[derive(Default, Debug)]
-    pub struct RwLock<T>(::shuttle::sync::RwLock<T>);
+    struct Sem {
+        condvar: ::shuttle::sync::Condvar,
+        permits: ::shuttle::sync::Mutex<usize>,
+    }
 
-    #[derive(Debug, Deref)]
-    #[deref(forward)]
-    pub struct RwLockReadGuard<'rwlock, T>(::shuttle::sync::RwLockReadGuard<'rwlock, T>);
+    unsafe impl Send for Sem {}
+    unsafe impl Sync for Sem {}
 
-    #[derive(Debug, Deref, DerefMut)]
-    #[deref(forward)]
-    #[deref_mut(forward)]
-    pub struct RwLockWriteGuard<'rwlock, T>(::shuttle::sync::RwLockWriteGuard<'rwlock, T>);
-
-    #[derive(Debug, Deref)]
-    #[deref(forward)]
-    pub struct RwLockUpgradableReadGuard<'rwlock, T>(::shuttle::sync::RwLockWriteGuard<'rwlock, T>);
-
-    impl<T> RwLock<T> {
-        pub const fn new(t: T) -> Self {
-            Self(::shuttle::sync::RwLock::new(t))
+    impl Sem {
+        const fn new() -> Self {
+            Self {
+                condvar: ::shuttle::sync::Condvar::new(),
+                permits: ::shuttle::sync::Mutex::new(usize::MAX),
+            }
         }
 
-        pub fn get_mut(&mut self) -> &mut T {
-            self.0.get_mut().unwrap()
+        fn take(&self, n: usize) {
+            let mut permits = self.permits.lock().unwrap();
+            while *permits < n {
+                permits = self.condvar.wait(permits).unwrap();
+            }
+            *permits -= n;
         }
 
-        pub fn into_inner(self) -> T {
-            self.0.into_inner().unwrap()
+        fn try_take(&self, n: usize) -> bool {
+            let mut permits = self.permits.lock().unwrap();
+            if *permits >= n {
+                *permits -= n;
+                true
+            } else {
+                false
+            }
         }
 
-        pub fn read(&self) -> RwLockReadGuard<'_, T> {
-            RwLockReadGuard(self.0.read().unwrap())
-        }
-
-        pub fn upgradable_read(&self) -> RwLockUpgradableReadGuard<'_, T> {
-            RwLockUpgradableReadGuard(self.0.write().unwrap())
-        }
-
-        pub fn write(&self) -> RwLockWriteGuard<'_, T> {
-            RwLockWriteGuard(self.0.write().unwrap())
-        }
-
-        pub fn try_write(&self) -> Option<RwLockWriteGuard<'_, T>> {
-            self.0.try_write().map(RwLockWriteGuard).ok()
-        }
-
-        pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
-            self.0.try_read().map(RwLockReadGuard).ok()
+        fn add(&self, n: usize) {
+            *self.permits.lock().unwrap() += n;
+            self.condvar.notify_all();
         }
     }
 
-    impl<'rwlock, T> RwLockUpgradableReadGuard<'rwlock, T> {
-        pub fn upgrade(self) -> RwLockWriteGuard<'rwlock, T> {
-            RwLockWriteGuard(self.0)
+    pub struct RawRwLock {
+        upgrade: Sem,
+        rwlock: Sem,
+    }
+
+    unsafe impl ::lock_api::RawRwLock for RawRwLock {
+        const INIT: Self = Self {
+            upgrade: Sem::new(),
+            rwlock: Sem::new(),
+        };
+
+        type GuardMarker = ::lock_api::GuardSend;
+
+        fn lock_shared(&self) {
+            self.rwlock.take(1);
         }
-        pub fn with_upgraded<Ret, F: FnOnce(&mut T) -> Ret>(&mut self, f: F) -> Ret {
-            f(&mut self.0)
+
+        fn try_lock_shared(&self) -> bool {
+            self.rwlock.try_take(1)
+        }
+
+        unsafe fn unlock_shared(&self) {
+            self.rwlock.add(1);
+        }
+
+        fn lock_exclusive(&self) {
+            self.upgrade.take(usize::MAX);
+            self.rwlock.take(usize::MAX);
+        }
+
+        fn try_lock_exclusive(&self) -> bool {
+            if self.upgrade.try_take(usize::MAX) {
+                if self.rwlock.try_take(usize::MAX) {
+                    return true;
+                }
+                self.upgrade.add(usize::MAX);
+            }
+            false
+        }
+
+        unsafe fn unlock_exclusive(&self) {
+            self.rwlock.add(usize::MAX);
+            self.upgrade.add(usize::MAX);
         }
     }
+
+    unsafe impl ::lock_api::RawRwLockUpgrade for RawRwLock {
+        fn lock_upgradable(&self) {
+            self.upgrade.take(usize::MAX);
+            self.rwlock.take(1);
+        }
+
+        fn try_lock_upgradable(&self) -> bool {
+            if self.upgrade.try_take(usize::MAX) {
+                if self.rwlock.try_take(1) {
+                    return true;
+                }
+                self.upgrade.add(usize::MAX);
+            }
+            false
+        }
+
+        unsafe fn unlock_upgradable(&self) {
+            self.rwlock.add(1);
+            self.upgrade.add(usize::MAX);
+        }
+
+        unsafe fn upgrade(&self) {
+            self.rwlock.take(usize::MAX - 1);
+        }
+
+        unsafe fn try_upgrade(&self) -> bool {
+            self.rwlock.try_take(usize::MAX - 1)
+        }
+    }
+
+    unsafe impl ::lock_api::RawRwLockDowngrade for RawRwLock {
+        unsafe fn downgrade(&self) {
+            self.rwlock.add(usize::MAX - 1);
+            self.upgrade.add(usize::MAX);
+        }
+    }
+
+    unsafe impl ::lock_api::RawRwLockUpgradeDowngrade for RawRwLock {
+        unsafe fn downgrade_upgradable(&self) {
+            self.upgrade.add(usize::MAX);
+        }
+
+        unsafe fn downgrade_to_upgradable(&self) {
+            self.rwlock.add(usize::MAX - 1);
+        }
+    }
+
+    pub type RwLock<T> = ::lock_api::RwLock<RawRwLock, T>;
+    pub type RwLockReadGuard<'a, T> = ::lock_api::RwLockReadGuard<'a, RawRwLock, T>;
+    pub type RwLockWriteGuard<'a, T> = ::lock_api::RwLockWriteGuard<'a, RawRwLock, T>;
+    pub type ArcRwLockReadGuard<T> = ::lock_api::ArcRwLockReadGuard<RawRwLock, T>;
+    pub type ArcRwLockWriteGuard<T> = ::lock_api::ArcRwLockWriteGuard<RawRwLock, T>;
+    pub type RwLockUpgradableReadGuard<'a, T> =
+        ::lock_api::RwLockUpgradableReadGuard<'a, RawRwLock, T>;
 }
