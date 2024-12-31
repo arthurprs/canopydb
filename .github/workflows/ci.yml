@@ -112,6 +112,7 @@ jobs:
           profile: minimal
           toolchain: nightly
           override: true
+      - run: apt-get install llvm-dev
       - run: cargo install cargo-fuzz
       - run: for fuzz_test in `cargo fuzz list`; do cargo fuzz run $fuzz_test -- -max_total_time=30 -timeout=5 || exit 1; done
       - run: cargo fuzz run fuzz_database -- -detect_leaks=0 -len_control=0 -max_total_time=600 -timeout=5 -jobs=2
