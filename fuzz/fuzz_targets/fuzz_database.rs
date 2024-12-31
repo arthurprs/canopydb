@@ -584,7 +584,14 @@ fuzz_target!(|ops: Vec<Op>| {
     db_options.checkpoint_interval = std::time::Duration::MAX;
     db_options.use_wal = test_recovery;
     db_options.default_commit_sync = false;
-    db_options.checkpoint_target_size = 16 * 4096 as usize;
+    if MAX_WRITERS == 1 {
+        db_options.checkpoint_target_size = 16 * 4096;
+    } else {
+        // effectively disable background checkpoints to avoid deadlocks
+        db_options.checkpoint_target_size = usize::MAX;
+        db_options.throttle_memory_limit = usize::MAX;
+        db_options.stall_memory_limit = usize::MAX;
+    }
     let db = canopydb::Database::with_options(options.clone(), db_options.clone()).unwrap();
     let mut world = World {
         state: WorldState {
