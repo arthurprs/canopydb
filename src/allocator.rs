@@ -253,8 +253,13 @@ impl Allocator {
             if let Some(id) = self.free.allocate(span) {
                 return Ok(id);
             }
-            let bulk =
-                bulk.get_or_insert_with(|| self.free.len() < Self::ALLOCATION_BATCH as PageId);
+            // Try bulk allocation if this is the first reservation attempt and either: the desired allocation
+            // is larger than a tenth of a batch OR the number of spans in the freelist is smaller than a batch.
+            // Bulk allocations get larger over time in order to effective amortize allocations in large transactions.
+            let bulk = bulk.get_or_insert_with(|| {
+                span > Self::ALLOCATION_BATCH as PageId / 10
+                    || self.free.len() < Self::ALLOCATION_BATCH as PageId
+            });
             self.reserve_from_main(span, *bulk)?;
             *bulk = false;
         }
