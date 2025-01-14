@@ -22,7 +22,7 @@ Benchmarks from <https://github.com/cberner/redb>, with [slight changes][redb co
 
 ### redb `lmdb_benchmark`
 
-|                           | redb       | lmdb       | canopydb   | rocksdb        | sled       | sanakirja |
+|                           | redb       | lmdb       | *canopydb*   | rocksdb        | sled       | sanakirja |
 |---------------------------|------------|------------|------------|----------------|------------|-----------|
 | bulk load                 | 3499ms     | **1466ms** | 2858ms     | 6597ms         | 7159ms     | 1544ms    |
 | individual writes         | 553ms      | 879ms      | **404ms**  | 781ms          | 1124ms     | 916ms     |
@@ -48,7 +48,7 @@ How to reproduce:
 
 ### redb `int_benchmark`
 
-|           | redb   | lmdb  | canopydb | rocksdb | sled   | sanakirja |
+|           | redb   | lmdb  | *canopydb* | rocksdb | sled   | sanakirja |
 |-----------|--------|-------|----------|---------|--------|-----------|
 | bulk load | 5020ms | 746ms | 576ms    | 5237ms  | 4898ms | 759ms     |
 
@@ -64,7 +64,7 @@ How to reproduce:
 
 ### redb `large_values_benchmark`
 
-|                        | redb    | lmdb   | canopydb | rocksdb | sled    |
+|                        | redb    | lmdb   | *canopydb* | rocksdb | sled    |
 |------------------------|---------|--------|----------|---------|---------|
 | bulk load (2MB values) | 18050ms | 9001ms | 19369ms  | 25578ms | 42775ms |
 
