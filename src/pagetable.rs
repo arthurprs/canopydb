@@ -7,7 +7,7 @@ use crate::{
     bytes::Bytes,
     page::Page,
     repr::{PageId, TxId},
-    SharedBytes, PAGE_SIZE,
+    ReservedPageHeader, SharedBytes, PAGE_SIZE,
 };
 
 // Do not use shuttle atomics, as they may trigger shuttle yields
@@ -66,7 +66,7 @@ impl InnerItem {
     #[inline]
     fn pages(&self) -> usize {
         if let Self::Page(page) = self {
-            page.as_slice().len() / PAGE_SIZE as usize
+            (size_of::<ReservedPageHeader>() + page.as_slice().len()) / PAGE_SIZE as usize
         } else {
             0
         }
@@ -81,10 +81,7 @@ impl From<Item> for InnerItem {
                 debug_assert!(!page.dirty);
                 debug_assert_eq!(page.compressed_page, None);
                 let ptr_range = page.raw_data.as_ref().as_ptr_range();
-                let bytes = page
-                    .raw_data
-                    .try_into_shared_bytes()
-                    .expect("Page data isn't shared bytes");
+                let bytes = page.raw_data.into_shared_bytes();
                 debug_assert_eq!(bytes.as_slice().as_ptr_range(), ptr_range);
                 Self::Page(bytes)
             }

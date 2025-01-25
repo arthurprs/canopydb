@@ -27,20 +27,18 @@ fail = "0.5"
 # pending https://github.com/brunoczim/fslock/pull/17, but only relevant for miri tests
 fslock = { git = "https://github.com/arthurprs/fslock.git", rev = "7ec91154136a2b3d567b1f79e87cae5d3ca3d927", version = "0.2" }
 quick_cache = { version = "0.6.9" }
-smallvec = { version = "2.0.0-alpha.7" }
+smallvec = { version = "2.0.0-alpha.10" }
 lock_api = { version = "0.4", features = ["arc_lock"] }
 log = "0.4"
 tempfile = "3.7"
 triomphe = { version = "0.1.14", default-features = false }
 lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
-memmap2 = "0.9"
 parking_lot = { version = "0.12", features = ["send_guard"] }
 rand = { version = "0.8" }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 zerocopy = { version = "0.7", default-features = false, features = ["derive"] }
 shuttle = { version = "0.8", optional = true }
 hashbrown = "0.14.5"
-sptr = "0.3.2"
 serde_json = { version = "1" }
 serde = { version = "1", features = ["derive"] }
 

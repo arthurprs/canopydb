@@ -13,6 +13,7 @@ extern crate log;
 
 mod allocator;
 mod bytes;
+mod bytes_impl;
 mod checkpoint;
 mod cursor;
 mod env;
@@ -40,7 +41,6 @@ mod shim;
 mod tree;
 mod write_batch;
 
-use core::panic;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
@@ -256,15 +256,13 @@ struct DatabaseRecovery {
 }
 
 struct DatabaseFile {
-    use_mmap: bool,
-    mmap: RwLock<Option<Arc<memmap2::Mmap>>>,
     file: File,
     file_len: atomic::AtomicU64,
     resize_lock: Mutex<()>,
 }
 
 impl DatabaseFile {
-    fn new(path: &std::path::Path, use_mmap: bool) -> Result<Self, Error> {
+    fn new(path: &std::path::Path) -> Result<Self, Error> {
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -275,60 +273,11 @@ impl DatabaseFile {
         utils::fadvise_read_ahead(&file, false)?;
         let file_len = file.metadata()?.len();
         let result = Self {
-            use_mmap,
-            mmap: Default::default(),
             resize_lock: Default::default(),
             file,
             file_len: file_len.into(),
         };
-        result.mmap_file_if_configured(file_len)?;
         Ok(result)
-    }
-
-    fn mmap_file_if_configured(&self, file_len: u64) -> Result<(), Error> {
-        if !self.use_mmap {
-            return Ok(());
-        }
-        fail::fail_point!("mmap", |s| Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("failpoint mmap {:?}", s)
-        )
-        .into()));
-
-        if self
-            .mmap
-            .read()
-            .as_ref()
-            .is_some_and(|m| m.len() as u64 >= file_len)
-        {
-            return Ok(());
-        }
-        // On unix, map twice as many bytes as the file len.
-        // Virtual memory is cheap and this avoid lots of remappings.
-        const MMAP_SIZE_MULT: u64 = 1 + (cfg!(unix) && !cfg!(fuzzing)) as u64;
-        // if usize overflows, saturate it so that mmap errors below.
-        let mmap_len = file_len
-            .saturating_mul(MMAP_SIZE_MULT)
-            .try_into()
-            .unwrap_or(usize::MAX);
-        let new_mmap = unsafe { memmap2::MmapOptions::new().len(mmap_len).map(&self.file)? };
-        #[cfg(unix)]
-        unsafe {
-            let _ = nix::sys::mman::madvise(
-                std::ptr::NonNull::new_unchecked(new_mmap.as_ptr() as *mut _),
-                new_mmap.len(),
-                nix::sys::mman::MmapAdvise::MADV_RANDOM,
-            );
-            #[cfg(any(target_os = "android", target_os = "linux"))]
-            let _ = nix::sys::mman::madvise(
-                std::ptr::NonNull::new_unchecked(new_mmap.as_ptr() as *mut _),
-                new_mmap.len(),
-                nix::sys::mman::MmapAdvise::MADV_NOHUGEPAGE,
-            );
-        };
-        *self.mmap.write() = Some(Arc::new(new_mmap));
-
-        Ok(())
     }
 
     fn ensure_file_size(
@@ -362,7 +311,6 @@ impl DatabaseFile {
         } else {
             return Ok(());
         }
-        self.mmap_file_if_configured(data_file_required_size)?;
         self.file_len
             .store(data_file_required_size, atomic::Ordering::Release);
         Ok(())
@@ -672,7 +620,7 @@ impl Database {
         env_db_name: String,
     ) -> Result<DatabaseRecovery, Error> {
         let _ = std::fs::create_dir_all(&opts.path);
-        let file = DatabaseFile::new(&opts.path.join("DATA"), opts.env.use_mmap)?;
+        let file = DatabaseFile::new(&opts.path.join("DATA"))?;
         opts.db.write_to_db_folder(&opts.path)?;
         let open = Mutex::new(Some(env_handle.clone()));
         let checkpoint_queue = CheckpointQueue::new();
@@ -1170,12 +1118,13 @@ impl Database {
 }
 
 fn total_size_to_span(needed_size: usize) -> Result<PageId, Error> {
-    let span = needed_size.div_ceil(PAGE_SIZE as usize);
+    let span = (size_of::<ReservedPageHeader>() + needed_size).div_ceil(PAGE_SIZE as usize);
     PageId::try_from(span).map_err(|_| Error::FreeList(String::from("Allocation too big").into()))
 }
 
 fn usable_size_to_noncontinuous_span(needed_size: usize) -> Result<PageId, Error> {
-    const RESTRICTED_PAGE_SIZE: usize = PAGE_SIZE as usize - size_of::<PageHeader>();
+    const RESTRICTED_PAGE_SIZE: usize =
+        PAGE_SIZE as usize - size_of::<PageHeader>() - size_of::<ReservedPageHeader>();
     let span = needed_size.div_ceil(RESTRICTED_PAGE_SIZE);
     PageId::try_from(span).map_err(|_| Error::FreeList(String::from("Allocation too big").into()))
 }
@@ -1763,10 +1712,8 @@ impl Transaction {
             };
         }
         let nck = NodeCacheKey::new(self.inner.env_db_id, redirect.map_or(0, |r| r.0), id);
-        if self.inner.opts.uses_shared_cache() || id.is_compressed() {
-            if let Some(node) = self.inner.env.shared_cache.get(&nck) {
-                return Ok(node);
-            }
+        if let Some(node) = self.inner.env.shared_cache.get(&nck) {
+            return Ok(node);
         }
         let page = if id.is_compressed() {
             self.read_compressed_page_uncompressed(id, redirect.map(|r| r.1))?
@@ -1778,10 +1725,8 @@ impl Transaction {
             )?
         };
         let node = Node::from_page(page)?;
-        if self.inner.opts.uses_shared_cache() || id.is_compressed() {
-            debug_assert!(!node.dirty);
-            self.inner.env.shared_cache.insert(nck, node.clone());
-        }
+        debug_assert!(!node.dirty);
+        self.inner.env.shared_cache.insert(nck, node.clone());
         Ok(node)
     }
 
@@ -1928,10 +1873,8 @@ impl Transaction {
                 .file
                 .ensure_file_size(false, allocator.main_next_page_id as u64 * PAGE_SIZE)?;
             self.inner.write_page(&write_page)?;
-            if self.inner.opts.uses_shared_cache() || pid.is_compressed() {
-                let nck = NodeCacheKey::new(self.inner.env_db_id, 0, pid);
-                let _ = self.inner.env.shared_cache.replace(nck, node, false);
-            }
+            let nck = NodeCacheKey::new(self.inner.env_db_id, 0, pid);
+            let _ = self.inner.env.shared_cache.replace(nck, node, false);
         }
         Ok(())
     }
@@ -2907,11 +2850,21 @@ impl DatabaseInner {
         trace!("write_page_at {} span {} at {}", page.id(), page.span(), at);
         debug_assert!(!page.id().is_compressed());
         debug_assert_eq!(
-            page.raw_data.len(),
+            size_of::<ReservedPageHeader>() + page.raw_data.len(),
+            page.span() as usize * PAGE_SIZE as usize
+        );
+        debug_assert_eq!(
+            page.raw_data
+                .raw_data_with_prefix(size_of::<ReservedPageHeader>())
+                .len(),
             page.span() as usize * PAGE_SIZE as usize
         );
         let offset = at as u64 * PAGE_SIZE;
-        self.file.file.write_all_at(&page.raw_data, offset)?;
+        self.file.file.write_all_at(
+            page.raw_data
+                .raw_data_with_prefix(size_of::<ReservedPageHeader>()),
+            offset,
+        )?;
         Ok(())
     }
 
@@ -2924,66 +2877,46 @@ impl DatabaseInner {
         debug_assert!(!id.is_compressed());
         debug_assert!(!at.is_compressed());
 
-        let page_bytes = if self.opts.env.use_mmap {
-            let mmap = self.file.mmap.read();
-            let mmap = mmap.as_ref().expect("Missing mmap");
-
-            let start = at as usize * PAGE_SIZE as usize;
-            let header = header_cast::<PageHeader, _>(&mmap[start..]);
-            if header.id != id {
-                return Err(io_invalid_data!("PageId mismatch {} != {}", header.id, id));
-            }
-            let span = PageId::from(header.span);
-            if span == 0 {
-                return Err(io_invalid_data!("0 length page!?"));
-            }
-            Bytes::from_mmap(
-                (*mmap).clone(),
-                start,
-                start + span as usize * PAGE_SIZE as usize,
-            )
-        } else {
-            let initial_span = span.unwrap_or(1);
-
-            let bytes = unsafe {
-                let mut bytes = UninitBytes::new(initial_span as usize * PAGE_SIZE as usize);
-                self.file
-                    .file
-                    .read_exact_at(mem::transmute(bytes.as_slice_mut()), at as u64 * PAGE_SIZE)
-                    .unwrap();
-                bytes.assume_init()
-            };
-
-            let header = header_cast::<PageHeader, _>(&bytes[..]);
-            if header.id != id {
-                return Err(io_invalid_data!("PageId mismatch {} != {}", header.id, id));
-            }
-            let span = PageId::from(header.span);
-            if span == 0 {
-                return Err(io_invalid_data!("0 length page!?"));
-            }
-
-            // TODO: make all pageIds carry a length?
-            if span > initial_span {
-                unsafe {
-                    let mut new_bytes = UninitBytes::new(span as usize * PAGE_SIZE as usize);
-                    let (a, b) = new_bytes.as_slice_mut().split_at_mut(bytes.len());
-                    std::ptr::copy_nonoverlapping(
-                        bytes.as_ptr(),
-                        a.as_mut_ptr().cast(),
-                        bytes.len(),
-                    );
-                    self.file
-                        .file
-                        .read_exact_at(mem::transmute(b), (at + initial_span) as u64 * PAGE_SIZE)?;
-                    new_bytes.assume_init()
-                }
-            } else {
-                bytes
-            }
+        let initial_span = span.unwrap_or(1);
+        let mut bytes = unsafe {
+            let mut bytes = UninitBytes::new(
+                initial_span as usize * PAGE_SIZE as usize - size_of::<ReservedPageHeader>(),
+            );
+            self.file
+                .file
+                .read_exact_at(
+                    mem::transmute(bytes.as_slice_mut()),
+                    at as u64 * PAGE_SIZE + size_of::<ReservedPageHeader>() as u64,
+                )
+                .unwrap();
+            bytes.assume_init()
         };
 
-        let page = Page::from_bytes(page_bytes)?;
+        let header = header_cast::<PageHeader, _>(&bytes[..]);
+        if header.id != id {
+            return Err(io_invalid_data!("PageId mismatch {} != {}", header.id, id));
+        }
+        let span = PageId::from(header.span);
+        if span == 0 {
+            return Err(io_invalid_data!("0 length page!?"));
+        }
+
+        // TODO: make all pageIds carry a length?
+        if span > initial_span {
+            unsafe {
+                let mut new_bytes = UninitBytes::new(
+                    span as usize * PAGE_SIZE as usize - size_of::<ReservedPageHeader>(),
+                );
+                let (a, b) = new_bytes.as_slice_mut().split_at_mut(bytes.len());
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), a.as_mut_ptr().cast(), bytes.len());
+                self.file
+                    .file
+                    .read_exact_at(mem::transmute(b), (at + initial_span) as u64 * PAGE_SIZE)?;
+                bytes = new_bytes.assume_init();
+            };
+        }
+
+        let page = Page::from_bytes(bytes)?;
 
         if self.opts.env.use_checksums && page.check_checksum() == Some(false) {
             return Err(io_invalid_data!("Checksum mismatch for page {id}"));
@@ -3095,7 +3028,9 @@ impl DatabaseInner {
             total_size_to_span(size_of::<CompressedPageHeader>() + compressed_len)?;
 
         let compressed_span = raw_compressed_span.min(page.span());
-        page_bytes.truncate(compressed_span as usize * PAGE_SIZE as usize);
+        page_bytes.truncate(
+            compressed_span as usize * PAGE_SIZE as usize - size_of::<ReservedPageHeader>(),
+        );
         let compressed_page_id = allocator.allocate(compressed_span)?;
 
         trace!(
@@ -3208,22 +3143,21 @@ impl DatabaseInner {
             *written_spans += write_span;
 
             // We must invalidate the cache as it could be holding an outdated version from previous checkpoints
-            if inner.opts.uses_shared_cache() || buffer_page.id().is_compressed() || !latest {
-                let nck = NodeCacheKey::new(
-                    inner.env_db_id,
-                    if latest { 0 } else { from },
-                    buffer_page.id(),
-                );
-                if let Ok(buffer_node) = UntypedNode::from_page(buffer_page.clone()) {
-                    if prioritize_in_shared_cache {
-                        inner.env.shared_cache.insert(nck, buffer_node);
-                    } else {
-                        let _ = inner.env.shared_cache.replace(nck, buffer_node, false);
-                    }
+            let nck = NodeCacheKey::new(
+                inner.env_db_id,
+                if latest { 0 } else { from },
+                buffer_page.id(),
+            );
+            if let Ok(buffer_node) = UntypedNode::from_page(buffer_page.clone()) {
+                if prioritize_in_shared_cache {
+                    inner.env.shared_cache.insert(nck, buffer_node);
                 } else {
-                    inner.env.shared_cache.remove(&nck);
+                    let _ = inner.env.shared_cache.replace(nck, buffer_node, false);
                 }
+            } else {
+                inner.env.shared_cache.remove(&nck);
             }
+
             if buffer_page.id().is_compressed() || !latest {
                 trace!("Redirecting page {} to {}", buffer_page.id(), write_pid);
                 #[cfg(feature = "shuttle")]
@@ -3644,11 +3578,7 @@ impl Checkpoint {
         // replace up to 50% of the cache or its free-space, whichever is higher.
         let max_weight_to_fill =
             (shared_cache_capacity / 2).max(shared_cache_capacity - shared_cache_weight);
-        let (compressed_only, mut elidible_count) = if txn.inner.opts.uses_shared_cache() {
-            (false, self.pages.len())
-        } else {
-            (true, self.compressed_pages_count)
-        };
+        let mut elidible_count = self.pages.len();
         let mut ratio = 0.0;
         if elidible_count != 0 {
             let avg_node_weight = (total_pages_weight + shared_cache_weight)
@@ -3663,11 +3593,8 @@ impl Checkpoint {
         // but it'd be best to capture hit counts in page table and using that instead
         let prioritize_txn_gte =
             txn_state.metapage.tx_id - (txn_range as f64 * ratio).ceil() as TxId;
-        move |from: TxId, page_id: PageId, latest: bool| -> bool {
-            let result = latest
-                && elidible_count != 0
-                && from >= prioritize_txn_gte
-                && (!compressed_only || page_id.is_compressed());
+        move |from: TxId, _page_id: PageId, latest: bool| -> bool {
+            let result = latest && elidible_count != 0 && from >= prioritize_txn_gte;
             elidible_count -= result as usize;
             result
         }

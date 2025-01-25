@@ -28,7 +28,6 @@ impl<'a> Arbitrary<'a> for Failure {
             "ftruncate",
             "fwrite",
             "unlink",
-            "mmap",
         ];
 
         let a = u.arbitrary::<u8>()?;

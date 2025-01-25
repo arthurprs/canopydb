@@ -42,32 +42,11 @@ pub struct EnvOptions {
     ///
     /// Default: `1 second`
     pub wal_background_sync_interval: Option<Duration>,
-    /// Whether to use memory mapped files for reading the database files.
-    ///
-    /// When checksums aren't enabled, non-compressed pages can point directly to the Mmap memory
-    /// and occupy no space in the page cache. This enables utilizing all the OS free memory
-    /// as a cache, which may be beneficial if the in-process page cache size is limited.
-    ///
-    /// When checksums are enabled the Mmap is still used for reads but the pages are read into
-    /// the process memory for checksum validation and then held in the page cache.
-    ///
-    /// Compressed pages always live in the page cache in their uncompressed form, even if the initial
-    /// compressed bytes were read from the Mmap.
-    ///
-    /// Safety: changes to the underlying file outside the process are Undefined Behavior (UB).
-    /// Applications must consider this safety risk when utilizing this feature.
-    ///
-    /// Default: `false`
-    pub use_mmap: bool,
     /// Whether to use checksums on _all_ database pages, which can detect filesystem data corruption.
     /// Note that this is _NOT_ required for durability crash safety, only to detect filesystem corruption.
     ///
     /// Canopy is crash safe and memory safe (the Rust safety definition) _regardless_ of this option,
     /// but file corruption may lead to panics instead of [crate::Error] being returned.
-    ///
-    /// Disabling this option usually improves performance, especially in combination with [EnvOptions::use_mmap].
-    /// It's up to the application to evaluate whether page checksums are required (e.g. it's already utilizing
-    /// a filesystem with checksums).
     ///
     /// Default: `false`
     pub use_checksums: bool,
@@ -107,7 +86,6 @@ pub struct EnvOptions {
     /// Database pages read from the Database files are cached in the page cache.
     ///
     /// Note that all databases in the same Environment share the page cache.
-    /// See [EnvOptions::use_mmap] for additional considerations when using memory mapped files.
     ///
     /// Default: `1 GB`
     pub page_cache_size: usize,
@@ -203,7 +181,6 @@ impl EnvOptions {
             path,
             disable_fsync: option_env!("CANOPYDB_DISABLE_FSYNC_DEFAULT").is_some(),
             halt_callback: None,
-            use_mmap: false,
             use_checksums: false,
             wal_background_sync_interval: None,
             max_wal_size: 256 * 1024 * 1024,
@@ -228,11 +205,6 @@ impl EnvOptions {
 impl EnvDbOptions {
     pub fn new(path: PathBuf, env: Arc<EnvOptions>, db: DbOptions) -> Self {
         Self { env, path, db }
-    }
-
-    #[inline]
-    pub fn uses_shared_cache(&self) -> bool {
-        !self.env.use_mmap || self.env.use_checksums
     }
 }
 

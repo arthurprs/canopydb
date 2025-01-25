@@ -1,49 +1,38 @@
-use std::{
-    mem::{self, ManuallyDrop, MaybeUninit},
-    ptr::NonNull,
-};
+use crate::bytes_impl::{ArcBytes, ArcBytesHeader, UniqueArcBytes};
+use std::{mem::MaybeUninit, ptr::NonNull};
 
-use sptr::Strict;
-use triomphe::{Arc, ThinArc, UniqueArc};
-use zerocopy::ByteSlice;
-
-pub(crate) struct UninitBytes(
-    UniqueArc<triomphe::HeaderSlice<triomphe::HeaderWithLength<()>, [MaybeUninit<u8>]>>,
-);
+pub(crate) struct UninitBytes(UniqueArcBytes);
 
 impl UninitBytes {
     pub fn new(len: usize) -> Self {
-        Self(UniqueArc::from_header_and_uninit_slice(
-            triomphe::HeaderWithLength::new((), len),
-            len,
-        ))
+        Self(UniqueArcBytes::new(len))
     }
 
-    pub unsafe fn assume_init(mut self) -> Bytes {
-        let slice = self.as_slice_mut();
+    #[inline]
+    pub unsafe fn assume_init(self) -> Bytes {
+        let backing = self.0.assume_init();
         Bytes {
-            ptr: NonNull::new_unchecked(slice.as_mut_ptr().cast()),
-            len: slice.len(),
-            backing: BackingPtr::new(Backing::Shared(Arc::into_thin(
-                self.0.assume_init_slice_with_header().shareable(),
-            ))),
+            ptr: backing.header_ptr().add(1).cast(),
+            len: backing.header_ptr().read().len as usize,
+            backing: SharedBytes(backing),
         }
     }
 
+    #[inline]
     pub fn as_slice_mut(&mut self) -> &mut [MaybeUninit<u8>] {
-        &mut self.0.slice
+        self.0.data_mut()
     }
 }
 
 #[derive(Clone, Debug)]
 #[repr(transparent)]
 #[debug("SharedBytes({})", self.as_slice().len())]
-pub(crate) struct SharedBytes(ThinArc<(), u8>);
+pub(crate) struct SharedBytes(ArcBytes);
 
 impl SharedBytes {
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        &self.0.slice
+        self.0.data()
     }
 }
 
@@ -52,11 +41,11 @@ impl SharedBytes {
 /// Roughly equivalent to an `Arc<Vec<u8>>`.
 ///
 /// Implements `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, `Borrow`, `AsRef`, `Deref` as a `&[u8]`
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Bytes {
     ptr: NonNull<u8>,
     len: usize,
-    backing: BackingPtr,
+    backing: SharedBytes,
 }
 
 unsafe impl Send for Bytes {}
@@ -98,19 +87,9 @@ impl Bytes {
     #[inline]
     pub(crate) fn from_arc_bytes(v: SharedBytes) -> Self {
         Self {
-            ptr: unsafe { NonNull::new_unchecked(v.0.slice.as_ptr().cast_mut()) },
-            len: v.0.header.length,
-            backing: BackingPtr::new(Backing::Shared(v.0)),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn from_mmap(m: Arc<memmap2::Mmap>, from: usize, to: usize) -> Self {
-        let slice = &m[from..to];
-        Self {
-            ptr: unsafe { NonNull::new_unchecked(slice.as_ptr().cast_mut()) },
-            len: slice.len(),
-            backing: BackingPtr::new(Backing::Mmap(m)),
+            ptr: unsafe { NonNull::new_unchecked(v.0.data().as_ptr().cast_mut()) },
+            len: v.0.data().len(),
+            backing: v,
         }
     }
 
@@ -124,7 +103,7 @@ impl Bytes {
         Self {
             ptr: unsafe { NonNull::new_unchecked(reference.as_ptr().cast_mut()) },
             len: reference.len(),
-            backing: self.backing.internal_clone(),
+            backing: self.backing.clone(),
         }
     }
 
@@ -153,24 +132,7 @@ impl Bytes {
 
     #[inline]
     pub(crate) fn is_unique(&mut self) -> bool {
-        self.backing.is_unique()
-    }
-
-    #[inline]
-    fn into_inner(mut self) -> Backing {
-        unsafe {
-            let inner = self.backing.take();
-            mem::forget(self);
-            inner
-        }
-    }
-
-    #[inline]
-    pub(crate) fn try_into_shared_bytes(self) -> Result<SharedBytes, ()> {
-        match self.into_inner() {
-            Backing::Shared(bytes) => Ok(SharedBytes(bytes)),
-            Backing::Mmap(_) => Err(()),
-        }
+        self.backing.0.is_unique()
     }
 
     #[inline]
@@ -178,23 +140,22 @@ impl Bytes {
         assert!(len <= self.len);
         self.len = len;
     }
-}
 
-impl Drop for Bytes {
+    /// Returns the byte buffer as a slice that includes the prefix to it.
+    /// No guarantees are provided for the contents of the prefix.
+    /// Panics if `prefix_size` is greater than the size of `ArcBytesHeader`.
     #[inline]
-    fn drop(&mut self) {
-        unsafe { self.backing.take() };
-    }
-}
-
-impl Clone for Bytes {
-    #[inline]
-    fn clone(&self) -> Self {
-        Self {
-            ptr: self.ptr,
-            len: self.len,
-            backing: self.backing.internal_clone(),
+    pub(crate) fn raw_data_with_prefix(&self, prefix_size: usize) -> &[u8] {
+        // Due to the usage of SharedBytes, we're guaranteed to have at least size_of<ArcBytesHeader> before the ptr
+        assert!(prefix_size <= size_of::<ArcBytesHeader>());
+        unsafe {
+            std::slice::from_raw_parts(self.ptr.as_ptr().sub(prefix_size), self.len + prefix_size)
         }
+    }
+
+    /// Return the backing `SharedBytes` instance.
+    pub(crate) fn into_shared_bytes(self) -> SharedBytes {
+        self.backing
     }
 }
 
@@ -251,94 +212,20 @@ impl std::hash::Hash for Bytes {
     }
 }
 
-/// Like triomphe::ArcUnion but more specific for this use case
-#[repr(transparent)]
-struct BackingPtr(NonNull<()>);
-
-impl BackingPtr {
-    #[inline]
-    fn untagged(&self) -> NonNull<()> {
-        unsafe { NonNull::new_unchecked(Strict::map_addr(self.0.as_ptr(), |p| p & !0b11)) }
-    }
-
-    #[inline]
-    fn tag(&self) -> usize {
-        Strict::addr(self.0.as_ptr()) & 0b11
-    }
-
-    #[inline]
-    fn new(backing: Backing) -> Self {
-        unsafe {
-            let tagged_ptr = match backing {
-                Backing::Shared(s) => mem::transmute::<_, *mut ()>(s),
-                Backing::Mmap(s) => Strict::map_addr(mem::transmute::<_, *mut ()>(s), |p| p | 0b01),
-            };
-            BackingPtr(NonNull::new_unchecked(tagged_ptr))
-        }
-    }
-
-    #[inline]
-    unsafe fn take(&mut self) -> Backing {
-        if self.tag() == 0b00 {
-            Backing::Shared(mem::transmute(self.0))
-        } else {
-            Backing::Mmap(mem::transmute(self.untagged()))
-        }
-    }
-
-    #[inline]
-    fn is_unique(&mut self) -> bool {
-        if self.tag() != 0 {
-            return false;
-        }
-        unsafe {
-            // This cast is very unsafe, but is valid because
-            // thriomphe ArcInner is repr(C), Arc and ThinArc and repr(transparent)
-            // and Arc::is_unique only touches the ArcInner. See triomphe::ArcUnion.
-            let arc: ManuallyDrop<Arc<()>> = mem::transmute(self.0.as_ptr());
-            Arc::is_unique(&arc)
-        }
-    }
-
-    #[inline]
-    fn internal_clone(&self) -> Self {
-        unsafe {
-            // See is_unique for safety of this transmute
-            let arc: ManuallyDrop<Arc<()>> = mem::transmute(self.untagged());
-            mem::forget(Arc::clone(&arc));
-        }
-        Self(self.0)
-    }
-}
-
-impl std::fmt::Debug for BackingPtr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.tag() == 0b00 {
-            write!(f, "Shared({:?})", self.0.as_ptr())
-        } else {
-            write!(f, "MMap({:?})", self.untagged())
-        }
-    }
-}
-
-enum Backing {
-    Shared(ThinArc<(), u8>),
-    Mmap(Arc<memmap2::Mmap>),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::tempfile;
 
     #[test]
     fn test_shared_vec() {
-        let mut a = Bytes::from_slice(b"\0");
+        let mut a = Bytes::from_slice(b"\x01");
         assert_eq!(a.len(), 1);
+        assert_eq!(a[0], 1u8);
+        a.as_mut().fill(0);
         assert_eq!(a[0], 0u8);
         assert_eq!(a.clone().len(), 1);
         assert!(a.is_unique());
+        let _ = a.clone();
         let mut b = a.restrict(&a[1..]);
         assert!(!a.is_unique());
         assert!(!b.is_unique());
@@ -347,26 +234,35 @@ mod tests {
         assert!(b.is_unique());
         assert_eq!(a.as_ref(), b"\0");
         assert_eq!(b.as_ref(), b"");
+        a.as_mut().fill(0x01);
+        assert_eq!(a.as_ref(), b"\x01");
     }
 
     #[test]
-    #[cfg_attr(miri, ignore)]
-    fn test_mmap() {
-        let mut f = tempfile().unwrap();
-        f.write_all(b"\0\0\0").unwrap();
-        let mut a = Bytes::from_mmap(Arc::new(unsafe { memmap2::Mmap::map(&f).unwrap() }), 0, 3);
-        assert_eq!(a.len(), 3);
-        assert_eq!(a.as_ref(), b"\0\0\0");
-        assert_eq!(a.clone().len(), 3);
-        assert!(!a.is_unique());
-        let mut b = a.restrict(&a[1..]);
-        assert!(!a.is_unique());
-        assert!(!b.is_unique());
-        a.make_unique();
-        assert!(a.is_unique());
-        assert_eq!(a.as_ref(), b"\0\0\0");
-        b.make_unique();
-        assert!(b.is_unique());
-        assert_eq!(b.as_ref(), b"\0\0");
+    fn test_from_slices() {
+        let slices: [&[u8]; 3] = [b"hello", b" ", b"world"];
+        let bytes = Bytes::from_slices(&slices);
+        assert_eq!(bytes.as_ref(), b"hello world");
+    }
+
+    #[test]
+    fn test_truncate() {
+        let mut bytes = Bytes::from_slice(b"truncate");
+        bytes.truncate(4);
+        assert_eq!(bytes.as_ref(), b"trun");
+    }
+
+    #[test]
+    fn test_raw_data_with_prefix() {
+        let bytes = Bytes::from_slice(b"prefix");
+        let raw_data = bytes.raw_data_with_prefix(4);
+        assert_eq!(&raw_data[4..], b"prefix");
+    }
+
+    #[test]
+    fn test_into_shared_bytes() {
+        let bytes = Bytes::from_slice(b"shared");
+        let shared_bytes = bytes.into_shared_bytes();
+        assert_eq!(shared_bytes.as_slice(), b"shared");
     }
 }
