@@ -14,7 +14,7 @@ Embedded Key-Value Storage Engine
 * Efficient durable commits via an optional Write-Ahead-Log (WAL)
 * Efficient async durability with background WAL fsyncs (e.g. every 500ms)
 * Bounded recovery times using an optional Write-Ahead-Log (WAL)
-* Concurrent write transactions with optimistic concurrency control
+* Concurrent write transactions with Optimistic Concurrency Control (OCC)
 * ACID transactions with serializable snapshot isolation (SSI) or snapshot isolation (SI)
 * Multi-Version-Concurrency-Control (MVCC) - writers do not block readers and vice versa
 * Long running read transactions have limited impact on the database
@@ -178,7 +178,7 @@ Canopydb and Redb are similar. Redb has a richer API that includes strongly type
 
 ### Fjall and Rocksdb
 
-Rocksdb and Fjall both implement Log-Structured-Merge Trees (LSMs) with optional support for transactions. These implementations can achieve higher random write performance, read-free writes and lower space utilization. Although these may come with tradeoffs like utilizing more file descriptors, lower read performance, more CPU overhead and write transactions that must fit in memory.
+Rocksdb and Fjall both implement Log-Structured-Merge Trees (LSMs) with optional support for transactions. These implementations can achieve higher random write performance, read-free writes and lower space utilization. Although these may come with tradeoffs like utilizing more file descriptors, more CPU overhead and write transactions that must fit in memory.
 
 ## License
 

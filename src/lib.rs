@@ -937,8 +937,8 @@ impl Database {
     /// Begins a write transactions
     ///
     /// If `concurrent` is true, the returned transaction may run concurrently with other
-    /// _concurrent_ multi write transactions. These transactions run under optimistic concurrency control
-    /// and Snapshot-Isolation (SI), see [`WriteTransaction`] for details.
+    /// _concurrent_ multi write transactions. These transactions run with Snapshot-Isolation (SI)
+    /// and commits with Optimistic Concurrency Control (OCC), see [`WriteTransaction`] for details.
     ///
     /// If `concurrent` is false, then the transactions runs in exclusive mode with Serializable-Snapshot-Isolation (SSI).
     ///
