@@ -834,9 +834,7 @@ fn test_snapshot_release() {
 #[test]
 fn write_to_pages() {
     let _f = test_folder();
-    let mut env_opts = EnvOptions::new(_f.path());
-    env_opts.use_mmap = false;
-
+    let env_opts = EnvOptions::new(_f.path());
     let db_opts = DbOptions::new();
     let db = Database::with_options(env_opts, db_opts).unwrap();
     let data = vec![0; 50_000];
@@ -845,7 +843,7 @@ fn write_to_pages() {
     assert!(matches!(
         db.inner.write_to_pages(&data, pages.clone()),
         Err(Error::Validation(e))
-        if *e == "write_to_pages spans are not enough to fit data, 45920 bytes remaining"
+        if *e == "write_to_pages spans are not enough to fit data, 45928 bytes remaining"
     ));
     for i in 100..10000 {
         pages.free(i * 2, 1).unwrap();
@@ -1435,8 +1433,6 @@ fn insert_works() {
     // env_opts.default_commit_sync = true;
     // env_opts.page_cache_size = 512 * 1024 * 1024;
     // env_opts.disable_fsync = false;
-    // env_opts.use_mmap = true;
-    // env_opts.use_mmap = false;
     // env_opts.use_checksums = true;
     // env_opts.checkpoint_target_size = 128 * 1024 * 1024;
     // env_opts.throttle_memory_limit = 2 * 256 * 1024 * 1024;
@@ -1546,7 +1542,6 @@ fn insert_works_seq_then_rand() {
     let mut rng = get_rng();
     let env_opts = EnvOptions::new(_f.path());
     // options.use_checksums = true;
-    // options.use_mmap = false;
     let db_opts = DbOptions::new();
     let db = Database::with_options(env_opts, db_opts).unwrap();
 

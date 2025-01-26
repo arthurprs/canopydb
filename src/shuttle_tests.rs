@@ -45,7 +45,6 @@ fn insert_works() {
 fn insert_works_stub() {
     let temp_dir = tempfile::tempdir().unwrap();
     let mut env_opts = EnvOptions::new(temp_dir.path());
-    env_opts.use_mmap = false;
     env_opts.disable_fsync = true;
     env_opts.page_cache_size = 1 * 1024 * 1024;
     let mut db_opts = DbOptions::default();

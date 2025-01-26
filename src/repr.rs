@@ -134,6 +134,16 @@ impl MaybeValue<'_> {
     }
 }
 
+/// An opaque/unused part of the page header that effectively lowers the size of the page slightly under N*4KB.
+/// This extra space is used to good effect when the page is in memory, it holds the `ArcBytes` header.
+/// This allows holding a reference counted page in memory without having to allocate a separate buffer for
+/// the header OR using a much larger backing allocation. For example, allocating a 4KB + 1 byte is often backed by
+/// a 5KB allocation, which is a ~25% waste of memory.
+#[repr(transparent)]
+pub struct ReservedPageHeader {
+    pub _reserved: crate::bytes_impl::ArcBytesHeader,
+}
+
 #[derive(Default, Copy, Debug, Clone, FromZeroes, FromBytes, AsBytes, PartialEq, Eq)]
 #[repr(C)]
 pub struct PageHeader {
@@ -160,7 +170,7 @@ pub struct NodeHeader {
     pub _padding: [u8; 1],
 }
 
-#[derive(Default, Copy, Debug, Clone, FromZeroes, FromBytes, AsBytes, Deref, DerefMut)]
+#[derive(Default, Debug, Clone, FromZeroes, FromBytes, AsBytes, Deref, DerefMut)]
 #[repr(C)]
 pub struct LeafHeader {
     #[deref]
@@ -210,9 +220,8 @@ pub struct MetapageHeader {
     pub wal_end: WalIdx,
     pub snapshot_tx_id: TxId,
     pub trees_tree: TreeValue,
-    pub _padding1: u8,
     pub indirections_tree: TreeValue,
-    pub _padding2: u8,
+    pub _padding: [u8; 2],
 }
 
 #[derive(Copy, Debug, Clone, FromZeroes, FromBytes, AsBytes)]
@@ -360,8 +369,9 @@ impl<const CLONE: bool> HeaderProvider for crate::page::Page<CLONE> {
 fn assert_valid_page_and_header<T: AsBytes + FromBytes>(slice: &[u8]) {
     // Ensure we're actually using page sizes and the aligned to 8.
     // In practice all(?) modern allocators align to 16.
-    debug_assert_ne!(slice.len() / PAGE_SIZE as usize, 0);
-    debug_assert_eq!(slice.len() % PAGE_SIZE as usize, 0);
+    let len_with_reserved = size_of::<ReservedPageHeader>() + slice.len();
+    debug_assert_ne!(len_with_reserved / PAGE_SIZE as usize, 0);
+    debug_assert_eq!(len_with_reserved % PAGE_SIZE as usize, 0);
     debug_assert_eq!(slice.as_ptr() as usize % 8, 0);
     // Ensure T size and alignment
     debug_assert!(std::mem::align_of::<T>() <= 8);

@@ -3,7 +3,7 @@ use std::mem::size_of;
 use crate::{
     error::io_invalid_input,
     repr::{header_cast, header_cast_mut, HeaderProvider, PageHeader, PageId},
-    Bytes, Error, PAGE_SIZE,
+    Bytes, Error, ReservedPageHeader, PAGE_SIZE,
 };
 
 #[derive(Debug)]
@@ -13,6 +13,7 @@ pub struct Page<const CLONE: bool = true> {
     // but due to alignment it saves no space...
     pub compressed_page: Option<(PageId, u32)>,
     // The main Page invariant is that it's backing data are well aligned bytes multiple of PAGE_SIZE
+    // But this raw_data starts at the Pageheader (after the ReservedPageHeader/ArcBytesHeader)
     #[debug(skip)]
     pub raw_data: Bytes,
 }
@@ -34,11 +35,11 @@ impl<const CLONE: bool> Page<CLONE> {
             dirty: false,
             raw_data,
         };
+        let total_page_size = size_of::<ReservedPageHeader>() + page.raw_data.len();
         if page.raw_data.as_ptr() as usize % 8 != 0 {
             Err(io_invalid_input!("Bad page alignment"))
-        } else if page.raw_data.len() % PAGE_SIZE as usize != 0
-            || page.span() != (page.raw_data.len() / PAGE_SIZE as usize) as PageId
-            || page.span() == 0
+        } else if total_page_size % PAGE_SIZE as usize != 0
+            || page.span() != ((total_page_size / PAGE_SIZE as usize) as PageId)
         {
             Err(io_invalid_input!("Bad page len"))
         } else {
@@ -58,7 +59,9 @@ impl<const CLONE: bool> Page<CLONE> {
         let mut page = Self {
             compressed_page: None,
             dirty,
-            raw_data: Bytes::new_zeroed(span as usize * PAGE_SIZE as usize),
+            raw_data: Bytes::new_zeroed(
+                span as usize * PAGE_SIZE as usize - size_of::<ReservedPageHeader>(),
+            ),
         };
         *page.header_mut() = PageHeader {
             id,
@@ -115,7 +118,8 @@ impl<const CLONE: bool> Page<CLONE> {
 
     #[inline]
     pub fn span(&self) -> PageId {
-        let span = (self.raw_data.len() / PAGE_SIZE as usize) as PageId;
+        let span = ((size_of::<ReservedPageHeader>() + self.raw_data.len()) / PAGE_SIZE as usize)
+            as PageId;
         debug_assert_eq!(span, PageId::from(self.header().span));
         span
     }
