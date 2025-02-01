@@ -16,8 +16,8 @@ arbitrary = "1"
 env_logger = "0.11"
 libfuzzer-sys = { version="0.4", features=["arbitrary-derive"] }
 log = "0.4"
-rand = { version = "*", features = ["small_rng"] }
-tempfile = "*"
+rand = { version = "0.8", features = ["small_rng"] }
+tempfile = "3.16"
 fail = "0.5"
 
 [dependencies.canopydb]
