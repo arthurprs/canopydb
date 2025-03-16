@@ -5,7 +5,7 @@ use std::{
     mem::{self, size_of},
 };
 
-use zerocopy::{AsBytes, Ref};
+use zerocopy::{IntoBytes, Ref};
 
 use crate::{
     page::Page,
@@ -206,9 +206,9 @@ impl<'node, TYPE: NodeRepr> InlineOffset<'node, TYPE> {
     #[inline]
     fn repr(&self, i: usize) -> &'node TYPE::Repr {
         let start = self.unit_size() * i;
-        Ref::<_, TYPE::Repr>::new_unaligned(&self.bytes[start..][..TYPE::repr_size()])
-            .unwrap()
-            .into_ref()
+        Ref::into_ref(
+            Ref::<_, TYPE::Repr>::from_bytes(&self.bytes[start..][..TYPE::repr_size()]).unwrap(),
+        )
     }
 
     #[inline]
@@ -223,7 +223,7 @@ impl<'node, TYPE: NodeRepr> InlineOffset<'node, TYPE> {
         let rkv = &self.bytes[self.unit_size() * i..][..self.unit_size()];
         let (r, kv) = rkv.split_at(TYPE::repr_size());
         let (k, v) = kv.split_at(self.key_len);
-        let repr = Ref::<_, TYPE::Repr>::new_unaligned(r).unwrap().into_ref();
+        let repr = Ref::into_ref(Ref::<_, TYPE::Repr>::from_bytes(r).unwrap());
         (repr, k, v)
     }
 
@@ -293,19 +293,21 @@ impl<'node, TYPE: NodeRepr> ExternalOffset<'node, TYPE> {
     #[inline]
     fn var_repr(&self, i: usize) -> &'node [VarRepr] {
         let offset = self.offsets[i].offset as usize;
-        Ref::<_, [VarRepr]>::new_slice_unaligned(
-            &self.page_bytes[offset..][..size_of::<VarRepr>() * TYPE::N_VAR],
+        Ref::into_ref(
+            Ref::<_, [VarRepr]>::from_bytes(
+                &self.page_bytes[offset..][..size_of::<VarRepr>() * TYPE::N_VAR],
+            )
+            .unwrap(),
         )
-        .unwrap()
-        .into_slice()
     }
 
     #[inline]
     fn repr(&self, i: usize) -> &'node TYPE::Repr {
         let start = self.offsets[i].offset as usize + size_of::<VarRepr>() * TYPE::N_VAR;
-        Ref::<_, TYPE::Repr>::new(&self.page_bytes[start..][..size_of::<TYPE::Repr>()])
-            .unwrap()
-            .into_ref()
+        Ref::into_ref(
+            Ref::<_, TYPE::Repr>::from_bytes(&self.page_bytes[start..][..size_of::<TYPE::Repr>()])
+                .unwrap(),
+        )
     }
 
     #[inline]
@@ -352,11 +354,10 @@ impl<'node, TYPE: NodeRepr> ExternalOffset<'node, TYPE> {
     ) -> impl Iterator<Item = (u32, &'node [u8])> + '_ {
         self.offsets[start..end].iter().map(move |o| {
             let bytes = &self.page_bytes[o.offset as usize..];
-            let var_reprs = Ref::<_, [VarRepr]>::new_slice_unaligned(
-                &bytes[..size_of::<VarRepr>() * TYPE::N_VAR],
-            )
-            .unwrap()
-            .into_slice();
+            let var_reprs = Ref::into_ref(
+                Ref::<_, [VarRepr]>::from_bytes(&bytes[..size_of::<VarRepr>() * TYPE::N_VAR])
+                    .unwrap(),
+            );
             let byte_len = size_of::<VarRepr>() * TYPE::N_VAR
                 + size_of::<TYPE::Repr>()
                 + var_reprs.iter().map(|a| a.len as usize).sum::<usize>();
@@ -370,11 +371,10 @@ impl<'node, TYPE: NodeRepr> ExternalOffset<'node, TYPE> {
     ) -> impl Iterator<Item = (&'node [u8], &'node [u8])> + '_ {
         self.offsets[start..end].iter().map(move |o| {
             let bytes = &self.page_bytes[o.offset as usize..];
-            let var_reprs = Ref::<_, [VarRepr]>::new_slice_unaligned(
-                &bytes[..size_of::<VarRepr>() * TYPE::N_VAR],
-            )
-            .unwrap()
-            .into_slice();
+            let var_reprs = Ref::into_ref(
+                Ref::<_, [VarRepr]>::from_bytes(&bytes[..size_of::<VarRepr>() * TYPE::N_VAR])
+                    .unwrap(),
+            );
             let prefix_len = size_of::<VarRepr>() * TYPE::N_VAR + size_of::<TYPE::Repr>();
             let suffix_len = var_reprs.iter().map(|a| a.len as usize).sum::<usize>();
             bytes[..prefix_len + suffix_len].split_at(prefix_len)
@@ -405,12 +405,12 @@ impl<'node, TYPE: NodeRepr> ExternalOffset<'node, TYPE> {
                 ord => return ord,
             }
 
-            let (var_reprs, after) = Ref::<_, [VarRepr]>::new_slice_unaligned_from_prefix(
+            let (var_reprs, after) = Ref::<_, [VarRepr]>::from_prefix_with_elems(
                 &self.page_bytes[o.offset as usize..],
                 TYPE::N_VAR,
             )
             .unwrap();
-            let key_len = var_reprs.into_slice()[0].len;
+            let key_len = Ref::into_ref(var_reprs)[0].len;
             let key = &after[TYPE::repr_size()..][..key_len as usize];
             debug_assert_eq!(read_prefix_u32(key), { o.prefix });
             key.cmp(search_key)
@@ -425,7 +425,7 @@ impl<'node, TYPE: NodeRepr> ExternalOffset<'node, TYPE> {
             [..size_of::<TYPE::Repr>() + var_reprs[0].len as usize + var_reprs[1].len as usize];
         let (r, kv) = rkv.split_at(size_of::<TYPE::Repr>());
         let (k, v) = kv.split_at(var_reprs[0].len as usize);
-        let repr = Ref::<_, TYPE::Repr>::new(r).unwrap().into_ref();
+        let repr = Ref::into_ref(Ref::<_, TYPE::Repr>::from_bytes(r).unwrap());
         (repr, k, v)
     }
 }
@@ -462,12 +462,13 @@ impl<'node, TYPE: NodeRepr> Offsets<'node, TYPE> {
     fn from_bytes(header: &NodeHeader, page_bytes: &'node [u8], start: usize, end: usize) -> Self {
         let node_header_size = Node::<TYPE>::static_header_size(header.key_prefix_len as usize);
         if header.fixed_key_len < 0 {
-            let offsets = Ref::<_, [Offset]>::new_slice_unaligned(
-                &page_bytes[node_header_size..]
-                    [size_of::<Offset>() * start..size_of::<Offset>() * end],
-            )
-            .unwrap()
-            .into_slice();
+            let offsets = Ref::into_ref(
+                Ref::<_, [Offset]>::from_bytes(
+                    &page_bytes[node_header_size..]
+                        [size_of::<Offset>() * start..size_of::<Offset>() * end],
+                )
+                .unwrap(),
+            );
             Offsets::External(ExternalOffset {
                 offsets,
                 repr: std::marker::PhantomData,
@@ -567,19 +568,21 @@ impl<TYPE: NodeRepr> OffsetsMut<'_, '_, TYPE> {
         let (head_data, tail_data) = self.node.data_mut().split_at_mut(head_len);
         let mut range_to_copy = new_offset..new_offset;
         let mut scratch_range = scratch.len()..scratch.len();
-        let offsets = Ref::<_, [Offset]>::new_slice_unaligned(
-            &mut head_data[header_size..][..size_of::<Offset>() * num_keys],
-        )
-        .unwrap()
-        .into_mut_slice();
+        let offsets = Ref::into_mut(
+            Ref::<_, [Offset]>::from_bytes(
+                &mut head_data[header_size..][..size_of::<Offset>() * num_keys],
+            )
+            .unwrap(),
+        );
         for offset_ptr in offsets.iter_mut() {
             let tail_offset = offset_ptr.offset as usize - head_len;
             let repr_total_len = {
-                let var_repr = Ref::<_, [VarRepr]>::new_slice_unaligned(
-                    &tail_data[tail_offset..][..size_of::<VarRepr>() * TYPE::N_VAR],
-                )
-                .unwrap()
-                .into_slice();
+                let var_repr = Ref::into_ref(
+                    Ref::<_, [VarRepr]>::from_bytes(
+                        &tail_data[tail_offset..][..size_of::<VarRepr>() * TYPE::N_VAR],
+                    )
+                    .unwrap(),
+                );
                 size_of::<VarRepr>() * TYPE::N_VAR
                     + TYPE::repr_size()
                     + var_repr.iter().map(|l| l.len as usize).sum::<usize>()
@@ -630,9 +633,8 @@ impl<TYPE: NodeRepr> OffsetsMut<'_, '_, TYPE> {
         let head_len = header_size + size_of::<Offset>() * new_num_keys;
         let mut offset = self.node.page.data().len() - self.node.tail_curr_size();
         let (head_data, tail_data) = self.node.data_mut().split_at_mut(head_len);
-        let offsets = Ref::<_, [Offset]>::new_slice_unaligned(&mut head_data[header_size..])
-            .unwrap()
-            .into_mut_slice();
+        let offsets =
+            Ref::into_mut(Ref::<_, [Offset]>::from_bytes(&mut head_data[header_size..]).unwrap());
         if *key_prefix_delta == Ok(0) {
             for (offset_ptr, (o_prefix, part)) in &mut offsets[old_num_keys..]
                 .iter_mut()
@@ -653,11 +655,11 @@ impl<TYPE: NodeRepr> OffsetsMut<'_, '_, TYPE> {
                 let (prefix_mut, suffix_mut) =
                     tail_data[offset - head_len..][..part_len].split_at_mut(prefix.len());
                 prefix_mut.copy_from_slice(prefix);
-                let var_reprs =
-                    Ref::<_, [VarRepr]>::new_slice_unaligned_from_prefix(prefix_mut, TYPE::N_VAR)
+                let var_reprs = Ref::into_mut(
+                    Ref::<_, [VarRepr]>::from_prefix_with_elems(prefix_mut, TYPE::N_VAR)
                         .unwrap()
-                        .0
-                        .into_mut_slice();
+                        .0,
+                );
                 var_reprs[0].len -= key_prefix_elided as u32;
                 suffix_mut.copy_from_slice(&suffix[key_prefix_elided..]);
                 offset_ptr.prefix = read_prefix_u32(&suffix_mut[..var_reprs[0].len as usize]);
@@ -674,11 +676,11 @@ impl<TYPE: NodeRepr> OffsetsMut<'_, '_, TYPE> {
                 let (prefix_mut, suffix_mut) =
                     tail_data[offset - head_len..][..part_len].split_at_mut(prefix.len());
                 prefix_mut.copy_from_slice(prefix);
-                let var_reprs =
-                    Ref::<_, [VarRepr]>::new_slice_unaligned_from_prefix(prefix_mut, TYPE::N_VAR)
+                let var_reprs = Ref::into_mut(
+                    Ref::<_, [VarRepr]>::from_prefix_with_elems(prefix_mut, TYPE::N_VAR)
                         .unwrap()
-                        .0
-                        .into_mut_slice();
+                        .0,
+                );
                 var_reprs[0].len += key_prefix_added.len() as u32;
                 suffix_mut[..key_prefix_added.len()].copy_from_slice(key_prefix_added);
                 suffix_mut[key_prefix_added.len()..].copy_from_slice(suffix);
@@ -725,11 +727,12 @@ impl<TYPE: NodeRepr> OffsetsMut<'_, '_, TYPE> {
             let start = external_offsets[i].offset as usize;
             external_offsets.copy_within(i + 1.., i);
             let removed_len = {
-                let var_repr = Ref::<_, [VarRepr]>::new_slice_unaligned(
-                    &self.node.page.raw_data[start..][..size_of::<VarRepr>() * TYPE::N_VAR],
-                )
-                .unwrap()
-                .into_slice();
+                let var_repr = Ref::into_ref(
+                    Ref::<_, [VarRepr]>::from_bytes(
+                        &self.node.page.raw_data[start..][..size_of::<VarRepr>() * TYPE::N_VAR],
+                    )
+                    .unwrap(),
+                );
                 size_of::<VarRepr>() * TYPE::N_VAR
                     + TYPE::repr_size()
                     + var_repr.iter().map(|l| l.len as usize).sum::<usize>()
@@ -764,11 +767,12 @@ impl<TYPE: NodeRepr> OffsetsMut<'_, '_, TYPE> {
     #[inline]
     fn external_offsets_with_len(&mut self, len: usize) -> &mut [Offset] {
         let header_size = self.node.header_size();
-        Ref::<_, [Offset]>::new_slice_unaligned(
-            &mut self.node.data_mut()[header_size..][..size_of::<Offset>() * len],
+        Ref::into_mut(
+            Ref::<_, [Offset]>::from_bytes(
+                &mut self.node.data_mut()[header_size..][..size_of::<Offset>() * len],
+            )
+            .unwrap(),
         )
-        .unwrap()
-        .into_mut_slice()
     }
 
     #[inline]
@@ -878,11 +882,12 @@ impl<TYPE: NodeRepr> OffsetsMut<'_, '_, TYPE> {
         let (mut write_area, k_len) = if self.is_external() {
             let offsets = self.external_offsets();
             let start = offsets[i].offset as usize;
-            let var_reprs = Ref::<_, [VarRepr; 2]>::new_unaligned(
-                &mut self.node.data_mut()[start..][..size_of::<[VarRepr; 2]>()],
-            )
-            .unwrap()
-            .into_mut();
+            let var_reprs = Ref::into_mut(
+                Ref::<_, [VarRepr; 2]>::from_bytes(
+                    &mut self.node.data_mut()[start..][..size_of::<[VarRepr; 2]>()],
+                )
+                .unwrap(),
+            );
             let v_len = v.repr_len();
             let prev_v_len = var_reprs[1].len as usize;
             if prev_v_len < v_len {
@@ -923,11 +928,12 @@ impl<TYPE: NodeRepr> OffsetsMut<'_, '_, TYPE> {
         } else {
             self.node.header_size() + self.inline_unit_size() * i
         };
-        let repr_mut = Ref::<_, TYPE::Repr>::new_unaligned(
-            &mut self.node.data_mut()[start..][..TYPE::repr_size()],
-        )
-        .unwrap()
-        .into_mut();
+        let repr_mut = Ref::into_mut(
+            Ref::<_, TYPE::Repr>::from_bytes(
+                &mut self.node.data_mut()[start..][..TYPE::repr_size()],
+            )
+            .unwrap(),
+        );
         *repr_mut = repr
     }
 }

@@ -1588,9 +1588,11 @@ impl Transaction {
                 "Compressed page {id} not found in indirections map"
             ));
         };
-        let v = Ref::<_, IndirectionValue>::new(v.as_ref())
-            .ok_or_else(|| io_invalid_data!("Invalid indirection value length"))?
-            .into_ref();
+        let v = Ref::into_ref(
+            Ref::<_, IndirectionValue>::from_bytes(v.as_ref())
+                .ok()
+                .ok_or_else(|| io_invalid_data!("Invalid indirection value length"))?,
+        );
         Ok((v.pid, PageId::from(v.span)))
     }
 
@@ -2403,11 +2405,9 @@ impl Transaction {
                 {
                     return Ok(Some(*value));
                 }
-                Ok(trees_tree.get(tree_name)?.map(|v| {
-                    *Ref::<_, TreeValue>::new_unaligned(v.as_ref())
-                        .unwrap()
-                        .into_ref()
-                }))
+                Ok(trees_tree
+                    .get(tree_name)?
+                    .map(|v| *Ref::into_ref(Ref::<_, TreeValue>::from_bytes(v.as_ref()).unwrap())))
             };
 
         for (tree_name, tree_state) in &mut tx_trees {
@@ -2636,9 +2636,7 @@ impl Transaction {
         let guard = self.trap.setup()?;
         for result in self.get_trees_tree().iter()? {
             let (k, v) = result?;
-            let value = *Ref::<_, TreeValue>::new_unaligned(v.as_ref())
-                .unwrap()
-                .into_ref();
+            let value = *Ref::into_ref(Ref::<_, TreeValue>::from_bytes(v.as_ref()).unwrap());
             if value.id == id {
                 return self.get_tree_internal(&k).guard_trap(guard);
             }
@@ -2682,9 +2680,8 @@ impl Transaction {
         }
         let tree = self.get_trees_tree();
         if let Some(cursor_value) = tree.get(name)? {
-            let value = *Ref::<_, TreeValue>::new_unaligned(cursor_value.as_ref())
-                .unwrap()
-                .into_ref();
+            let value =
+                *Ref::into_ref(Ref::<_, TreeValue>::from_bytes(cursor_value.as_ref()).unwrap());
             let name = Arc::<[u8]>::from(name);
             if self.is_write_or_checkpoint_txn() {
                 self.trees

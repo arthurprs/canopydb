@@ -6,7 +6,7 @@ use std::{
 use crate::error::{io_invalid_data, Error};
 use smallvec::SmallVec;
 use triomphe::Arc;
-use zerocopy::{AsBytes, FromBytes, FromZeroes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 type PageId = u32;
 
@@ -107,7 +107,7 @@ struct Shard {
     ranges: Arc<RangeVec>,
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, FromZeroes, AsBytes, FromBytes)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, IntoBytes, FromBytes, KnownLayout, Immutable)]
 #[repr(C)]
 #[debug("Range({page}, {zspan})")]
 struct Range {
@@ -657,20 +657,20 @@ impl Freelist {
     pub fn deserialize(mut bytes: &[u8]) -> Result<(Self, usize), Error> {
         let original_len = bytes.len();
         let mut num_shards = 0u32;
-        bytes.read_exact(num_shards.as_bytes_mut())?;
+        bytes.read_exact(num_shards.as_mut_bytes())?;
         let mut shards = ShardsVec::with_capacity(num_shards as usize);
         for _ in 0..num_shards {
             let mut base = 0u32;
-            bytes.read_exact(base.as_bytes_mut())?;
+            bytes.read_exact(base.as_mut_bytes())?;
             let mut num_ranges = 0u32;
-            bytes.read_exact(num_ranges.as_bytes_mut())?;
+            bytes.read_exact(num_ranges.as_mut_bytes())?;
             let ranges_num_bytes = mem::size_of::<Range>() * num_ranges as usize;
             let ranges_bytes = bytes
                 .get(..ranges_num_bytes)
                 .ok_or_else(|| io_invalid_data!("Not enough range bytes: {}", ranges_num_bytes))?;
             bytes = &bytes[ranges_num_bytes..];
             let mut ranges = smallvec::smallvec![Range::default(); num_ranges as usize];
-            ranges.as_bytes_mut().copy_from_slice(ranges_bytes);
+            ranges.as_mut_bytes().copy_from_slice(ranges_bytes);
             let (hist, len) = Shard::calc_histogram_and_len(&ranges);
             shards.push(Shard {
                 len,

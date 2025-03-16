@@ -13,7 +13,7 @@ use crate::{
 
 use smallvec::SmallVec;
 use triomphe::Arc;
-use zerocopy::AsBytes;
+use zerocopy::IntoBytes;
 
 #[derive(Debug)]
 pub struct WriteBatch {
@@ -91,13 +91,13 @@ impl WriteBatch {
         });
         let read_u32_prefixed_bytes = |src: &mut dyn Read| -> io::Result<Vec<u8>> {
             let mut len = 0u32;
-            src.read_exact(len.as_bytes_mut())?;
+            src.read_exact(len.as_mut_bytes())?;
             read_bytes(src, len as usize)
         };
 
         std::iter::from_fn(move || {
             let mut op_code = 0u8;
-            match bytes.read(op_code.as_bytes_mut()) {
+            match bytes.read(op_code.as_mut_bytes()) {
                 Ok(0) => return None,
                 Ok(_) => (),
                 Err(e) => return Some(Err(e)),
@@ -106,25 +106,25 @@ impl WriteBatch {
                 let operation = match op_code {
                     op_bytes::DATABASE => {
                         let mut db_id = DbId::default();
-                        bytes.read_exact(db_id.as_bytes_mut())?;
+                        bytes.read_exact(db_id.as_mut_bytes())?;
                         Operation::Database(db_id)
                     }
                     op_bytes::INSERT => {
                         let mut tree_id = TreeId::default();
-                        bytes.read_exact(tree_id.as_bytes_mut())?;
+                        bytes.read_exact(tree_id.as_mut_bytes())?;
                         let key = read_u32_prefixed_bytes(bytes)?;
                         let value = read_u32_prefixed_bytes(bytes)?;
                         Operation::Insert(tree_id, key, value)
                     }
                     op_bytes::DELETE => {
                         let mut tree_id = TreeId::default();
-                        bytes.read_exact(tree_id.as_bytes_mut())?;
+                        bytes.read_exact(tree_id.as_mut_bytes())?;
                         let key = read_u32_prefixed_bytes(bytes)?;
                         Operation::Delete(tree_id, key)
                     }
                     op_bytes::DELETE_RANGE => {
                         let mut tree_id = TreeId::default();
-                        bytes.read_exact(tree_id.as_bytes_mut())?;
+                        bytes.read_exact(tree_id.as_mut_bytes())?;
                         let mut byte = [0u8];
                         let mut start = Bound::Unbounded;
                         let mut end = Bound::Unbounded;
@@ -146,7 +146,7 @@ impl WriteBatch {
                     }
                     op_bytes::CREATE_TREE => {
                         let mut tree_id = TreeId::default();
-                        bytes.read_exact(tree_id.as_bytes_mut())?;
+                        bytes.read_exact(tree_id.as_mut_bytes())?;
                         let tree_name = read_u32_prefixed_bytes(bytes)?;
                         let options = read_u32_prefixed_bytes(bytes)?;
                         let options = TreeOptions::from_bytes(&options)?;

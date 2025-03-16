@@ -7,7 +7,13 @@ description = "Transactional key-value storage engine"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/arthurprs/canopydb"
-keywords = ["database", "storage-engine", "embedded-database", "lmdb", "rocksdb"]
+keywords = [
+    "database",
+    "storage-engine",
+    "embedded-database",
+    "lmdb",
+    "rocksdb",
+]
 categories = ["data-structures", "database-implementations", "algorithms"]
 exclude = ["fuzz/", "assets/"]
 
@@ -22,7 +28,13 @@ nightly = []
 foldhash = "0.1"
 bitflags = "2"
 dashmap = "6"
-derive_more = { version = "2", features = ["debug", "deref", "deref_mut", "display", "error"] }
+derive_more = { version = "2", features = [
+    "debug",
+    "deref",
+    "deref_mut",
+    "display",
+    "error",
+] }
 fail = "0.5"
 # pending https://github.com/brunoczim/fslock/pull/17, but only relevant for miri tests
 fslock = { git = "https://github.com/arthurprs/fslock.git", rev = "7ec91154136a2b3d567b1f79e87cae5d3ca3d927", version = "0.2" }
@@ -36,7 +48,7 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 parking_lot = { version = "0.12", features = ["send_guard"] }
 rand = { version = "0.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
-zerocopy = { version = "0.7", default-features = false, features = ["derive"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 shuttle = { version = "0.8", optional = true }
 hashbrown = "0.15"
 serde_json = { version = "1" }
@@ -67,7 +79,7 @@ opt-level = 3
 env_logger = "0.11"
 proptest = "1"
 rand = { version = "0.9", features = ["small_rng"] }
-sysinfo = { version = "0.33", default-features = false, features = ["system"]}
+sysinfo = { version = "0.34", default-features = false, features = ["system"] }
 
 [profile.dev.package."lz4_flex"]
 opt-level = 3
