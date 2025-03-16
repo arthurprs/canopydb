@@ -13,7 +13,7 @@ use crate::{
 };
 
 use triomphe::Arc;
-use zerocopy::AsBytes;
+use zerocopy::IntoBytes;
 
 #[derive(Debug, Default)]
 pub(crate) struct MainAllocator {

@@ -6,7 +6,7 @@ use std::{
 use crate::error::{io_invalid_data, Error};
 use smallvec::SmallVec;
 use triomphe::Arc;
-use zerocopy::{AsBytes, FromBytes, FromZeroes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 type PageId = u32;
 
@@ -107,7 +107,7 @@ struct Shard {
     ranges: Arc<RangeVec>,
 }
 
-#[derive(Copy, Clone, Debug, Default, PartialEq, FromZeroes, AsBytes, FromBytes)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, IntoBytes, FromBytes, KnownLayout, Immutable)]
 #[repr(C)]
 #[debug("Range({page}, {zspan})")]
 struct Range {

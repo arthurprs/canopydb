@@ -13,7 +13,7 @@ use crate::{
 
 use smallvec::SmallVec;
 use triomphe::Arc;
-use zerocopy::AsBytes;
+use zerocopy::IntoBytes;
 
 #[derive(Debug)]
 pub struct WriteBatch {

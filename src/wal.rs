@@ -31,7 +31,7 @@ const WAL_FOOTER_MAGIC: u64 = 0xF35C835A2600946B;
 const HEADER_BYTES_IGNORED_BY_CHECKSUM: usize = size_of::<u64>() * 2;
 const INITIAL_WAL_IDX: u64 = 0;
 
-#[derive(Default, Copy, Debug, Clone, FromZeroes, FromBytes, AsBytes)]
+#[derive(Default, Copy, Debug, Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]
 struct CommitHeader {
     magic: u64,
@@ -42,7 +42,7 @@ struct CommitHeader {
     items_len: u64,
 }
 
-#[derive(Default, Copy, Debug, Clone, FromZeroes, FromBytes, AsBytes)]
+#[derive(Default, Copy, Debug, Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]
 struct CommitFooter {
     magic: u64,
@@ -168,7 +168,7 @@ struct WalFileIter {
     done: bool,
 }
 
-#[derive(Debug, Clone, Copy, FromZeroes, FromBytes, AsBytes)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C, align(4096))]
 struct Block([u8; 4096]);
 
@@ -464,10 +464,10 @@ impl WalFile {
         );
         let (commit_header, rest) =
             Ref::<_, CommitHeader>::new_from_prefix(buffer.as_bytes_mut()).unwrap();
-        let commit_header = commit_header.into_mut();
+        let commit_header = Ref::into_mut(commit_header);
         let (item_lens, _buffer_rest) =
             Ref::<_, [u64]>::new_slice_from_prefix(rest, items.len()).unwrap();
-        let item_lens = item_lens.into_mut_slice();
+        let item_lens = Ref::into_mut(item_lens);
 
         let first_item_idx = this.range.end;
         *commit_header = CommitHeader {

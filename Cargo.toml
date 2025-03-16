@@ -36,7 +36,7 @@ lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 parking_lot = { version = "0.12", features = ["send_guard"] }
 rand = { version = "0.9" }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
-zerocopy = { version = "0.7", default-features = false, features = ["derive"] }
+zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 shuttle = { version = "0.8", optional = true }
 hashbrown = "0.15"
 serde_json = { version = "1" }
