@@ -213,6 +213,15 @@ impl<'tx> Tree<'tx> {
         self.value.num_keys
     }
 
+    /// Returns the height of the Tree.
+    ///
+    /// The height of a tree is equivalent to its depth or the number of levels.
+    /// An empty tree w/o a root node has a height of 0.
+    #[inline]
+    pub fn height(&self) -> usize {
+        self.value.level as usize + (self.value.root != PageId::default()) as usize
+    }
+
     /// Returns the value corresponding to the key.
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>, Error> {
         let guard = self.tx.trap.setup()?;
@@ -936,6 +945,18 @@ impl<'tx> Tree<'tx> {
     #[inline]
     pub fn keys(&self) -> Result<RangeKeysIter<'_>, Error> {
         self.range_keys::<&[u8]>(..)
+    }
+
+    /// Returns the first key-value pair in the tree.
+    #[inline]
+    pub fn first(&self) -> Result<Option<(Bytes, Bytes)>, Error> {
+        self.iter()?.next().transpose()
+    }
+
+    /// Returns the last key-value pair in the tree.
+    #[inline]
+    pub fn last(&self) -> Result<Option<(Bytes, Bytes)>, Error> {
+        self.iter()?.next_back().transpose()
     }
 
     pub(crate) fn compact(&mut self, page_id_threshold: PageId) -> Result<(), Error> {
