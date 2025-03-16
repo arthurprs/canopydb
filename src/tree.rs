@@ -916,15 +916,15 @@ impl<'tx> Tree<'tx> {
     /// If values aren't required, [Tree::prefix_keys] may be more efficient.
     pub fn prefix<K: AsRef<[u8]>>(&self, prefix: &K) -> Result<RangeIter<'_>, Error> {
         let start = prefix.as_ref();
-        if start.is_empty() {
-            return self.iter();
-        }
         let mut end = SmallVec::<u8, 256>::from_slice(start);
-        match end.last_mut() {
-            Some(last) if *last < u8::MAX => *last += 1,
-            _ => end.push(0x00),
+        for (i, b) in end.iter_mut().enumerate().rev() {
+            if *b < u8::MAX {
+                *b += 1;
+                end.truncate(i + 1);
+                return BaseIter::new(self, start..end.as_slice()).map(RangeIter);
+            }
         }
-        BaseIter::new(self, start..end.as_slice()).map(RangeIter)
+        self.range(start..)
     }
 
     /// Returns an iterator over the prefix.
