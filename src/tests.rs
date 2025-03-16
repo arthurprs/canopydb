@@ -480,6 +480,49 @@ fn range_works_stub(items: u32, root_level: u8) {
 }
 
 #[test]
+fn prefix_works() {
+    let _f = test_folder();
+    let db = Database::new(_f.path()).unwrap();
+    let tx = db.begin_write().unwrap();
+    let mut tree = tx.get_or_create_tree(b"default").unwrap();
+    let mut model = BTreeMap::new();
+    let byte_values = [0u8, 1, 254, 255];
+    let keys = byte_values.into_iter().flat_map(move |a| {
+        byte_values.into_iter().flat_map(move |b| {
+            byte_values
+                .into_iter()
+                .flat_map(move |c| byte_values.into_iter().map(move |d| [a, b, c, d]))
+        })
+    });
+
+    for key in keys.clone() {
+        tree.insert(&key, &key).unwrap();
+        model.insert(key, key);
+    }
+
+    for key in keys {
+        for i in 0..=4 {
+            let prefix = &key[..i];
+            let results = tree
+                .prefix(&prefix)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let expect = model
+                .iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .collect::<Vec<_>>();
+            for ((rk, rv), (ek, ev)) in results.iter().zip(expect.iter()) {
+                let result = (rk.as_ref(), rv.as_ref());
+                let expect = (ek.as_ref(), ev.as_ref());
+                assert_eq!(result, expect);
+            }
+            assert_eq!(results.len(), expect.len());
+        }
+    }
+}
+
+#[test]
 fn delete_range_works() {
     delete_range_stub(100, 0);
     delete_range_stub(1_000, 1);
