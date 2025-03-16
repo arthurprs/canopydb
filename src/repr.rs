@@ -28,7 +28,7 @@ bitflags::bitflags! {
 }
 
 #[derive(FromZeroes, FromBytes, AsBytes, Unaligned)]
-#[repr(packed)]
+#[repr(C, packed)]
 pub struct IndirectionValue {
     pub pid: PageId,
     pub span: U24,
@@ -179,7 +179,7 @@ pub struct LeafHeader {
 }
 
 #[derive(Copy, Clone, FromZeroes, FromBytes, AsBytes, Unaligned)]
-#[repr(packed)]
+#[repr(C, packed)]
 pub struct Offset {
     /// Slot offset from the beginning of the page
     pub offset: u32,
@@ -193,7 +193,7 @@ impl fmt::Debug for Offset {
 }
 
 #[derive(Copy, Clone, FromZeroes, FromBytes, AsBytes, Unaligned)]
-#[repr(packed)]
+#[repr(C, packed)]
 pub struct VarRepr {
     pub len: u32,
 }
@@ -233,13 +233,13 @@ pub struct CompressedPageHeader {
 }
 
 #[derive(Copy, Clone, FromZeroes, FromBytes, AsBytes, Unaligned)]
-#[repr(packed)]
+#[repr(C, packed)]
 pub struct BranchKeyRepr {
     pub child: PageId,
 }
 
 #[derive(Copy, Clone, FromZeroes, FromBytes, AsBytes, Unaligned)]
-#[repr(packed)]
+#[repr(C, packed)]
 pub struct LeafPairRepr {
     pub flags: u8,
 }
@@ -254,7 +254,7 @@ impl LeafPairRepr {
 }
 
 #[derive(Default, Copy, Clone, FromZeroes, FromBytes, AsBytes, Unaligned)]
-#[repr(packed)]
+#[repr(C, packed)]
 pub struct TreeValue {
     pub id: TreeId,
     pub root: PageId,
@@ -303,7 +303,7 @@ impl TreeValue {
 }
 
 #[derive(Default, Copy, Clone, FromZeroes, FromBytes, AsBytes, Unaligned, PartialEq, Eq)]
-#[repr(packed)]
+#[repr(C, packed)]
 pub struct MappingValue {
     pub compressed_page_id: PageId,
 }

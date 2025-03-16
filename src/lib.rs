@@ -101,7 +101,7 @@ pub(crate) const MIN_PAGE_COMPRESSION_BYTES: u64 = 2 * PAGE_SIZE;
 pub(crate) const MIN_PAGE_COMPRESSION_BYTES: u64 = PAGE_SIZE;
 
 #[derive(Copy, Clone)]
-#[repr(packed)]
+#[repr(C, packed)]
 struct FreePage(TxId, PageId);
 
 impl std::fmt::Debug for FreePage {
