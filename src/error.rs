@@ -40,7 +40,7 @@ impl Error {
     }
 
     pub(crate) fn io_other(msg: &str) -> Self {
-        Self::Io(io::Error::new(io::ErrorKind::Other, msg))
+        Self::Io(io::Error::other(msg))
     }
 
     pub(crate) fn internal_clone(&self) -> Self {

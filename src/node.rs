@@ -1603,7 +1603,7 @@ fn test_read_prefix_u32() {
         .map(|_| {
             let len = rand::random::<u8>() as usize;
             let mut v = vec![0u8; len];
-            rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut v);
+            rand::RngCore::fill_bytes(&mut rand::rng(), &mut v);
             v
         })
         .collect::<Vec<_>>();

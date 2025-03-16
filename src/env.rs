@@ -280,10 +280,10 @@ impl Drop for EnvironmentInner {
 ///
 /// The WAL enables tree key things:
 /// * after a restart the WAL can be replayed to recover the Database to a consistent point in time,
-///    including between different databases.
+///   including between different databases.
 /// * the WAL can be efficiently `fsync`ed to make transactions durable (in combination with the point above)
 /// * transactions from different databases can be committed together atomically. This allows stablishing a
-///    consistent state between them.
+///   consistent state between them.
 ///
 /// # Page Cache
 ///
