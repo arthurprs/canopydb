@@ -462,12 +462,9 @@ impl WalFile {
             }) / BLOCK_SIZE_U64) as usize,
             Block::default(),
         );
-        let (commit_header, rest) =
-            Ref::<_, CommitHeader>::from_prefix(buffer.as_mut_bytes()).unwrap();
-        let commit_header = Ref::into_mut(commit_header);
+        let (commit_header, rest) = CommitHeader::mut_from_prefix(buffer.as_mut_bytes()).unwrap();
         let (item_lens, _buffer_rest) =
-            Ref::<_, [u64]>::from_prefix_with_elems(rest, items.len()).unwrap();
-        let item_lens = Ref::into_mut(item_lens);
+            <[u64]>::mut_from_prefix_with_elems(rest, items.len()).unwrap();
 
         let first_item_idx = this.range.end;
         *commit_header = CommitHeader {

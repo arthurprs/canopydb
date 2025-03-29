@@ -403,12 +403,12 @@ fn assert_valid_page_and_header<T: IntoBytes + FromBytes + KnownLayout + Immutab
 impl HeaderProvider for [u8] {
     #[inline]
     fn cast<T: IntoBytes + FromBytes + KnownLayout + Immutable>(&self) -> &T {
-        Ref::into_ref(Ref::<_, T>::from_prefix(self).unwrap().0)
+        T::ref_from_prefix(self).unwrap().0
     }
 
     #[inline]
     fn cast_mut<T: IntoBytes + FromBytes + KnownLayout + Immutable>(&mut self) -> &mut T {
-        Ref::into_mut(Ref::<_, T>::from_prefix(self).unwrap().0)
+        T::mut_from_prefix(self).unwrap().0
     }
 
     #[inline]
