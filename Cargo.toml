@@ -15,7 +15,7 @@ exclude = ["fuzz/", "assets/"]
 default = []
 # default = ["nightly"]
 # default = ["shuttle"]
-shuttle = ["dep:shuttle"]
+shuttle = ["dep:shuttle", "dep:rand_08"]
 nightly = []
 
 [dependencies]
@@ -43,6 +43,7 @@ triomphe = { version = "0.1.14", default-features = false }
 lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
 parking_lot = { version = "0.12", features = ["send_guard"] }
 rand = { version = "0.9" }
+rand_08 = { package = "rand", version = "0.8", optional = true }
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 zerocopy = { version = "0.8", default-features = false, features = ["derive"] }
 shuttle = { version = "0.8", optional = true }
