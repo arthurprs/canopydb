@@ -7,13 +7,7 @@ description = "Transactional key-value storage engine"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/arthurprs/canopydb"
-keywords = [
-    "database",
-    "storage-engine",
-    "embedded-database",
-    "lmdb",
-    "rocksdb",
-]
+keywords = ["database", "storage-engine", "embedded-database", "key-value"]
 categories = ["data-structures", "database-implementations", "algorithms"]
 exclude = ["fuzz/", "assets/"]
 
@@ -25,9 +19,9 @@ shuttle = ["dep:shuttle"]
 nightly = []
 
 [dependencies]
-foldhash = "0.1"
+foldhash = "0.1.5"
 bitflags = "2"
-dashmap = "6"
+dashmap = "=7.0.0-rc2"
 derive_more = { version = "2", features = [
     "debug",
     "deref",
@@ -38,8 +32,10 @@ derive_more = { version = "2", features = [
 fail = "0.5"
 # pending https://github.com/brunoczim/fslock/pull/17, but only relevant for miri tests
 fslock = { git = "https://github.com/arthurprs/fslock.git", rev = "7ec91154136a2b3d567b1f79e87cae5d3ca3d927", version = "0.2" }
-quick_cache = { version = "0.6.11" }
-smallvec = { version = "2.0.0-alpha.10" }
+quick_cache = { version = "0.6.11", default-features = false, features = [
+    "parking_lot",
+] }
+smallvec = { version = "2.0.0-alpha.11" }
 lock_api = { version = "0.4", features = ["arc_lock"] }
 log = "0.4"
 tempfile = "3.16"
