@@ -736,10 +736,9 @@ impl Database {
             }
         }
         if txn.state.get().metapage.freelist_root != PageId::default() {
-            let freelist_spans = self
+            let (freelist_spans, _) = self
                 .inner
-                .read_from_pages(txn.state.get().metapage.freelist_root, false)?
-                .0;
+                .read_from_pages(txn.state.get().metapage.freelist_root, false)?;
             spans.merge(&freelist_spans).unwrap();
         }
 
@@ -1589,8 +1588,7 @@ impl Transaction {
             ));
         };
         let v = IndirectionValue::ref_from_bytes(v.as_ref())
-            .ok()
-            .ok_or_else(|| io_invalid_data!("Invalid indirection value length"))?;
+            .map_err(|_| io_invalid_data!("Invalid indirection value length"))?;
         Ok((v.pid, PageId::from(v.span)))
     }
 
