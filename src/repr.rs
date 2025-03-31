@@ -16,7 +16,9 @@ pub type WalIdx = u64;
 pub const METAPAGE_MAGIC: u64 = 0x7BB61DB6F32611B1;
 pub const FIRST_COMPRESSED_PAGE: PageId = ((PageId::MAX as u64 + 1) / 4 * 3) as PageId;
 
-#[derive(Default, Copy, Debug, Clone, FromZeroes, FromBytes, AsBytes, PartialEq, Eq)]
+#[derive(
+    Default, Copy, Debug, Clone, FromBytes, IntoBytes, KnownLayout, Immutable, PartialEq, Eq,
+)]
 #[repr(C)]
 pub struct PageFlags(u8);
 
@@ -27,14 +29,16 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(FromZeroes, FromBytes, AsBytes, Unaligned)]
+#[derive(FromBytes, IntoBytes, Unaligned, KnownLayout, Immutable)]
 #[repr(C, packed)]
 pub struct IndirectionValue {
     pub pid: PageId,
     pub span: U24,
 }
 
-#[derive(Default, Copy, Debug, Clone, FromZeroes, FromBytes, AsBytes, PartialEq, Eq)]
+#[derive(
+    Default, Copy, Debug, Clone, FromBytes, IntoBytes, KnownLayout, Immutable, PartialEq, Eq,
+)]
 #[repr(C)]
 #[debug("{}", u32::from(*self))]
 pub struct U24([u8; 3]);
@@ -129,7 +133,7 @@ impl MaybeValue<'_> {
     #[inline]
     pub fn overflow_from_bytes(b: &[u8]) -> MaybeValue<'static> {
         let mut overflow = [PageId::default(); 2];
-        overflow.as_bytes_mut().copy_from_slice(b);
+        overflow.as_mut_bytes().copy_from_slice(b);
         MaybeValue::Overflow(overflow)
     }
 }
@@ -144,7 +148,9 @@ pub struct ReservedPageHeader {
     pub _reserved: crate::bytes_impl::ArcBytesHeader,
 }
 
-#[derive(Default, Copy, Debug, Clone, FromZeroes, FromBytes, AsBytes, PartialEq, Eq)]
+#[derive(
+    Default, Copy, Debug, Clone, FromBytes, IntoBytes, KnownLayout, Immutable, PartialEq, Eq,
+)]
 #[repr(C)]
 pub struct PageHeader {
     pub checksum: u32,
@@ -153,7 +159,7 @@ pub struct PageHeader {
     pub flags: PageFlags,
 }
 
-#[derive(Default, Copy, Debug, Clone, FromZeroes, FromBytes, AsBytes)]
+#[derive(Default, Copy, Debug, Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]
 pub struct NodeHeader {
     pub page_header: PageHeader,
@@ -170,7 +176,7 @@ pub struct NodeHeader {
     pub _padding: [u8; 1],
 }
 
-#[derive(Default, Debug, Clone, FromZeroes, FromBytes, AsBytes, Deref, DerefMut)]
+#[derive(Default, Debug, Clone, FromBytes, IntoBytes, Deref, DerefMut, KnownLayout, Immutable)]
 #[repr(C)]
 pub struct LeafHeader {
     #[deref]
@@ -178,7 +184,7 @@ pub struct LeafHeader {
     pub node_header: NodeHeader,
 }
 
-#[derive(Copy, Clone, FromZeroes, FromBytes, AsBytes, Unaligned)]
+#[derive(Copy, Clone, FromBytes, IntoBytes, Unaligned, KnownLayout, Immutable)]
 #[repr(C, packed)]
 pub struct Offset {
     /// Slot offset from the beginning of the page
@@ -192,13 +198,15 @@ impl fmt::Debug for Offset {
     }
 }
 
-#[derive(Copy, Clone, FromZeroes, FromBytes, AsBytes, Unaligned)]
+#[derive(Copy, Clone, FromBytes, IntoBytes, Unaligned, KnownLayout, Immutable)]
 #[repr(C, packed)]
 pub struct VarRepr {
     pub len: u32,
 }
 
-#[derive(Default, Copy, Debug, Clone, FromZeroes, FromBytes, AsBytes, Deref, DerefMut)]
+#[derive(
+    Default, Copy, Debug, Clone, FromBytes, IntoBytes, KnownLayout, Immutable, Deref, DerefMut,
+)]
 #[repr(C)]
 pub struct BranchHeader {
     #[deref]
@@ -207,7 +215,7 @@ pub struct BranchHeader {
     pub leftmost_pointer: PageId,
 }
 
-#[derive(Default, Copy, Debug, Clone, FromZeroes, FromBytes, AsBytes)]
+#[derive(Default, Copy, Debug, Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]
 pub struct MetapageHeader {
     pub page_header: PageHeader,
@@ -224,7 +232,7 @@ pub struct MetapageHeader {
     pub _padding: [u8; 2],
 }
 
-#[derive(Copy, Debug, Clone, FromZeroes, FromBytes, AsBytes)]
+#[derive(Copy, Debug, Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]
 pub struct CompressedPageHeader {
     pub page_header: PageHeader,
@@ -232,13 +240,13 @@ pub struct CompressedPageHeader {
     pub uncompressed_len: u32,
 }
 
-#[derive(Copy, Clone, FromZeroes, FromBytes, AsBytes, Unaligned)]
+#[derive(Copy, Clone, FromBytes, IntoBytes, Unaligned, KnownLayout, Immutable)]
 #[repr(C, packed)]
 pub struct BranchKeyRepr {
     pub child: PageId,
 }
 
-#[derive(Copy, Clone, FromZeroes, FromBytes, AsBytes, Unaligned)]
+#[derive(Copy, Clone, FromBytes, IntoBytes, Unaligned, KnownLayout, Immutable)]
 #[repr(C, packed)]
 pub struct LeafPairRepr {
     pub flags: u8,
@@ -253,7 +261,7 @@ impl LeafPairRepr {
     }
 }
 
-#[derive(Default, Copy, Clone, FromZeroes, FromBytes, AsBytes, Unaligned)]
+#[derive(Default, Copy, Clone, FromBytes, IntoBytes, Unaligned, KnownLayout, Immutable)]
 #[repr(C, packed)]
 pub struct TreeValue {
     pub id: TreeId,
@@ -302,15 +310,21 @@ impl TreeValue {
     }
 }
 
-#[derive(Default, Copy, Clone, FromZeroes, FromBytes, AsBytes, Unaligned, PartialEq, Eq)]
+#[derive(Default, Copy, Clone, FromBytes, IntoBytes, Unaligned, PartialEq, Eq)]
 #[repr(C, packed)]
 pub struct MappingValue {
     pub compressed_page_id: PageId,
 }
 
 pub trait NodeRepr: NodeType {
-    type Header: Default + FromBytes + AsBytes + Deref<Target = NodeHeader> + DerefMut;
-    type Repr: Unaligned + FromBytes + AsBytes;
+    type Header: Default
+        + FromBytes
+        + IntoBytes
+        + KnownLayout
+        + Immutable
+        + Deref<Target = NodeHeader>
+        + DerefMut;
+    type Repr: Unaligned + FromBytes + IntoBytes + KnownLayout + Immutable;
     const N_VAR: usize;
 
     fn repr_size() -> usize {
@@ -320,53 +334,61 @@ pub trait NodeRepr: NodeType {
 
 /// Assert that the start of the page can be cast to a header
 #[inline(always)]
-pub(crate) fn header_cast<T: AsBytes + FromBytes, P: HeaderProvider + ?Sized>(slice: &P) -> &T {
+pub(crate) fn header_cast<
+    T: IntoBytes + FromBytes + KnownLayout + Immutable,
+    P: HeaderProvider + ?Sized,
+>(
+    slice: &P,
+) -> &T {
     slice.cast()
 }
 
 #[inline(always)]
-pub(crate) fn header_cast_mut<T: AsBytes + FromBytes, P: HeaderProvider + ?Sized>(
+pub(crate) fn header_cast_mut<
+    T: IntoBytes + FromBytes + KnownLayout + Immutable,
+    P: HeaderProvider + ?Sized,
+>(
     slice: &mut P,
 ) -> &mut T {
     slice.cast_mut()
 }
 
 pub(crate) trait HeaderProvider {
-    fn cast<T: AsBytes + FromBytes>(&self) -> &T;
-    fn cast_mut<T: AsBytes + FromBytes>(&mut self) -> &mut T;
-    fn split_off<T: AsBytes + FromBytes>(&self) -> &[u8];
-    fn split_off_mut<T: AsBytes + FromBytes>(&mut self) -> &mut [u8];
+    fn cast<T: IntoBytes + FromBytes + KnownLayout + Immutable>(&self) -> &T;
+    fn cast_mut<T: IntoBytes + FromBytes + KnownLayout + Immutable>(&mut self) -> &mut T;
+    fn split_off<T: IntoBytes + FromBytes + KnownLayout + Immutable>(&self) -> &[u8];
+    fn split_off_mut<T: IntoBytes + FromBytes + KnownLayout + Immutable>(&mut self) -> &mut [u8];
 }
 
 // Safety: Page invariant is that it's backing data are well aligned bytes multiple of PAGE_SIZE
 impl<const CLONE: bool> HeaderProvider for crate::page::Page<CLONE> {
     #[inline]
-    fn cast<T: AsBytes + FromBytes>(&self) -> &T {
+    fn cast<T: IntoBytes + FromBytes + KnownLayout + Immutable>(&self) -> &T {
         assert_valid_page_and_header::<T>(self.data());
         unsafe { &*self.data().as_ptr().cast::<T>() }
     }
 
     #[inline]
-    fn cast_mut<T: AsBytes + FromBytes>(&mut self) -> &mut T {
+    fn cast_mut<T: IntoBytes + FromBytes + KnownLayout + Immutable>(&mut self) -> &mut T {
         assert_valid_page_and_header::<T>(self.data_mut());
         unsafe { &mut *self.data_mut().as_mut_ptr().cast::<T>() }
     }
 
     #[inline]
-    fn split_off<T: AsBytes + FromBytes>(&self) -> &[u8] {
+    fn split_off<T: IntoBytes + FromBytes + KnownLayout + Immutable>(&self) -> &[u8] {
         assert_valid_page_and_header::<T>(self.data());
         unsafe { self.data().get_unchecked(size_of::<T>()..) }
     }
 
     #[inline]
-    fn split_off_mut<T: AsBytes + FromBytes>(&mut self) -> &mut [u8] {
+    fn split_off_mut<T: IntoBytes + FromBytes + KnownLayout + Immutable>(&mut self) -> &mut [u8] {
         assert_valid_page_and_header::<T>(self.data_mut());
         unsafe { self.data_mut().get_unchecked_mut(size_of::<T>()..) }
     }
 }
 
 #[inline]
-fn assert_valid_page_and_header<T: AsBytes + FromBytes>(slice: &[u8]) {
+fn assert_valid_page_and_header<T: IntoBytes + FromBytes + KnownLayout + Immutable>(slice: &[u8]) {
     // Ensure we're actually using page sizes and the aligned to 8.
     // In practice all(?) modern allocators align to 16.
     let len_with_reserved = size_of::<ReservedPageHeader>() + slice.len();
@@ -380,22 +402,22 @@ fn assert_valid_page_and_header<T: AsBytes + FromBytes>(slice: &[u8]) {
 
 impl HeaderProvider for [u8] {
     #[inline]
-    fn cast<T: AsBytes + FromBytes>(&self) -> &T {
-        Ref::<_, T>::new_from_prefix(self).unwrap().0.into_ref()
+    fn cast<T: IntoBytes + FromBytes + KnownLayout + Immutable>(&self) -> &T {
+        T::ref_from_prefix(self).unwrap().0
     }
 
     #[inline]
-    fn cast_mut<T: AsBytes + FromBytes>(&mut self) -> &mut T {
-        Ref::<_, T>::new_from_prefix(self).unwrap().0.into_mut()
+    fn cast_mut<T: IntoBytes + FromBytes + KnownLayout + Immutable>(&mut self) -> &mut T {
+        T::mut_from_prefix(self).unwrap().0
     }
 
     #[inline]
-    fn split_off<T: AsBytes + FromBytes>(&self) -> &[u8] {
+    fn split_off<T: IntoBytes + FromBytes + KnownLayout + Immutable>(&self) -> &[u8] {
         &self[size_of::<T>()..]
     }
 
     #[inline]
-    fn split_off_mut<T: AsBytes + FromBytes>(&mut self) -> &mut [u8] {
+    fn split_off_mut<T: IntoBytes + FromBytes + KnownLayout + Immutable>(&mut self) -> &mut [u8] {
         &mut self[size_of::<T>()..]
     }
 }

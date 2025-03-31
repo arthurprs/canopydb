@@ -31,7 +31,7 @@ const WAL_FOOTER_MAGIC: u64 = 0xF35C835A2600946B;
 const HEADER_BYTES_IGNORED_BY_CHECKSUM: usize = size_of::<u64>() * 2;
 const INITIAL_WAL_IDX: u64 = 0;
 
-#[derive(Default, Copy, Debug, Clone, FromZeroes, FromBytes, AsBytes)]
+#[derive(Default, Copy, Debug, Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]
 struct CommitHeader {
     magic: u64,
@@ -42,7 +42,7 @@ struct CommitHeader {
     items_len: u64,
 }
 
-#[derive(Default, Copy, Debug, Clone, FromZeroes, FromBytes, AsBytes)]
+#[derive(Default, Copy, Debug, Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C)]
 struct CommitFooter {
     magic: u64,
@@ -168,7 +168,7 @@ struct WalFileIter {
     done: bool,
 }
 
-#[derive(Debug, Clone, Copy, FromZeroes, FromBytes, AsBytes)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 #[repr(C, align(4096))]
 struct Block([u8; 4096]);
 
@@ -196,7 +196,7 @@ impl WalFileIter {
 
         let mut header = CommitHeader::default();
         let mut offset = self.commit_offset;
-        self.file.read_exact_at(header.as_bytes_mut(), offset)?;
+        self.file.read_exact_at(header.as_mut_bytes(), offset)?;
         offset += header.as_bytes().len() as u64;
 
         if header.magic != WAL_HEADER_MAGIC {
@@ -218,7 +218,7 @@ impl WalFileIter {
 
         self.next_item_lens.resize(header.items_len as usize, 0);
         let items_lens = self.next_item_lens.make_contiguous();
-        self.file.read_exact_at(items_lens.as_bytes_mut(), offset)?;
+        self.file.read_exact_at(items_lens.as_mut_bytes(), offset)?;
         offset += items_lens.as_bytes().len() as u64;
 
         if items_lens.iter().copied().sum::<u64>() != header.items_byte_len {
@@ -261,7 +261,7 @@ impl WalFileIter {
             left_to_hash -= read_len;
         }
         let mut footer = CommitFooter::default();
-        self.file.read_exact_at(footer.as_bytes_mut(), offset)?;
+        self.file.read_exact_at(footer.as_mut_bytes(), offset)?;
 
         if footer.magic != WAL_FOOTER_MAGIC {
             return Err(io::Error::new(
@@ -462,12 +462,9 @@ impl WalFile {
             }) / BLOCK_SIZE_U64) as usize,
             Block::default(),
         );
-        let (commit_header, rest) =
-            Ref::<_, CommitHeader>::new_from_prefix(buffer.as_bytes_mut()).unwrap();
-        let commit_header = commit_header.into_mut();
+        let (commit_header, rest) = CommitHeader::mut_from_prefix(buffer.as_mut_bytes()).unwrap();
         let (item_lens, _buffer_rest) =
-            Ref::<_, [u64]>::new_slice_from_prefix(rest, items.len()).unwrap();
-        let item_lens = item_lens.into_mut_slice();
+            <[u64]>::mut_from_prefix_with_elems(rest, items.len()).unwrap();
 
         let first_item_idx = this.range.end;
         *commit_header = CommitHeader {
@@ -491,7 +488,7 @@ impl WalFile {
         // If the write includes the footer it must be treated as fatal as it could be written and recoverable
         if !incremental_items && this.direct_io_file.is_some() {
             debug_assert_eq!(buffer.as_bytes().len() as u64, needed_size);
-            let mut buffer_cursor = &mut buffer.as_bytes_mut()[header_size..];
+            let mut buffer_cursor = &mut buffer.as_mut_bytes()[header_size..];
             for item in items.iter_mut() {
                 let buf = item.fill_buf()?;
                 hasher.write(buf);

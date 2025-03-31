@@ -1,5 +1,5 @@
 use crate::*;
-use rand::seq::SliceRandom;
+use rand_08::seq::SliceRandom;
 use shuttle::{
     rand::Rng,
     sync::{atomic, Mutex},

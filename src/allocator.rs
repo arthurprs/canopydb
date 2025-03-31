@@ -13,7 +13,7 @@ use crate::{
 };
 
 use triomphe::Arc;
-use zerocopy::AsBytes;
+use zerocopy::IntoBytes;
 
 #[derive(Debug, Default)]
 pub(crate) struct MainAllocator {
@@ -94,10 +94,10 @@ impl MainAllocator {
 
     pub fn from_bytes(mut data: &[u8]) -> Result<Self, Error> {
         let mut result = Self::default();
-        data.read_exact(result.next_page_id.as_bytes_mut())?;
-        data.read_exact(result.next_indirection_id.as_bytes_mut())?;
+        data.read_exact(result.next_page_id.as_mut_bytes())?;
+        data.read_exact(result.next_indirection_id.as_mut_bytes())?;
         let mut num_parts = 0u8;
-        data.read_exact(num_parts.as_bytes_mut())?;
+        data.read_exact(num_parts.as_mut_bytes())?;
         if num_parts != 4 {
             return Err(io_invalid_data!("Expected 4 freelists"));
         }

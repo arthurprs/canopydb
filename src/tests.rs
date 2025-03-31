@@ -7,23 +7,23 @@ use tempfile::TempDir;
 const COMP_DATASET: &[u8] = include_bytes!("../assets/gh_events.json");
 
 fn get_rng() -> impl Rng + Clone {
-    let seed: u64 = std::env::var("SEED")
-        .map_or_else(|_| thread_rng().gen(), |seed_str| seed_str.parse().unwrap());
+    let seed: u64 =
+        std::env::var("SEED").map_or_else(|_| rand::random(), |seed_str| seed_str.parse().unwrap());
     println!("SEED {}", seed);
     SmallRng::seed_from_u64(seed)
 }
 
 fn very_rand_bytes(rng: &mut impl Rng, a: usize, b: usize) -> Vec<u8> {
-    let len = rng.gen_range(a..=b);
+    let len = rng.random_range(a..=b);
     let mut buffer = vec![0; len];
     rng.fill_bytes(&mut buffer);
     buffer
 }
 
 fn rand_str(rng: &mut impl Rng, a: usize, b: usize) -> Vec<u8> {
-    let len = rng.gen_range(a..=b);
+    let len = rng.random_range(a..=b);
 
-    let start = rng.gen_range(0..COMP_DATASET.len() - len);
+    let start = rng.random_range(0..COMP_DATASET.len() - len);
     COMP_DATASET[start..start + len].to_vec()
 }
 
@@ -399,12 +399,12 @@ fn range_works_stub(items: u32, root_level: u8) {
 
     let mut rng_ = rng.clone();
     let mut rng_bound = || {
-        if rng_.gen_bool(0.01) {
+        if rng_.random_bool(0.01) {
             Bound::Unbounded
-        } else if rng_.gen_bool(0.5) {
-            Bound::Excluded(rng_.gen_range(0..=items * 2 + 1))
+        } else if rng_.random_bool(0.5) {
+            Bound::Excluded(rng_.random_range(0..=items * 2 + 1))
         } else {
-            Bound::Included(rng_.gen_range(0..=items * 2 + 1))
+            Bound::Included(rng_.random_range(0..=items * 2 + 1))
         }
     };
 
@@ -457,7 +457,7 @@ fn range_works_stub(items: u32, root_level: u8) {
 
         loop {
             let before = start.len() + end.len();
-            if rng.gen_bool(0.5) {
+            if rng.random_bool(0.5) {
                 if let Some(Ok(a)) = range.next() {
                     start.push(a);
                 }
@@ -548,12 +548,12 @@ fn delete_range_stub(items: u32, root_level: u8) {
 
     let mut rng_ = get_rng();
     let mut rng_bound = || {
-        if rng_.gen_bool(0.01) {
+        if rng_.random_bool(0.01) {
             Bound::Unbounded
-        } else if rng_.gen_bool(0.5) {
-            Bound::Excluded(rng_.gen_range(0..=items * 2 + 1))
+        } else if rng_.random_bool(0.5) {
+            Bound::Excluded(rng_.random_range(0..=items * 2 + 1))
         } else {
-            Bound::Included(rng_.gen_range(0..=items * 2 + 1))
+            Bound::Included(rng_.random_range(0..=items * 2 + 1))
         }
     };
 
@@ -1628,7 +1628,7 @@ fn insert_works_seq_then_rand() {
             eprintln!("Round {}", _round_no);
         }
         let sample: Vec<_> = (0..5)
-            .map(|_| rng.gen_range(0..keys).to_be().as_bytes().to_vec())
+            .map(|_| rng.random_range(0..keys).to_be().as_bytes().to_vec())
             .collect::<Vec<_>>();
         let tx = db.begin_write().unwrap();
         let mut tree = tx.get_or_create_tree(b"default").unwrap();
@@ -1671,7 +1671,10 @@ struct TestGuard {
 impl TestGuard {
     fn new() -> Self {
         let mut sys = sysinfo::System::new();
-        sys.refresh_process(Pid::from_u32(std::process::id() as _));
+        sys.refresh_processes(
+            sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(std::process::id() as _)]),
+            false,
+        );
         Self {
             start: Instant::now(),
             sys,
@@ -1679,8 +1682,10 @@ impl TestGuard {
     }
 
     fn print(&mut self) {
-        self.sys
-            .refresh_process(Pid::from_u32(std::process::id() as _));
+        self.sys.refresh_processes(
+            sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(std::process::id() as _)]),
+            false,
+        );
         let written = self
             .sys
             .process(Pid::from_u32(std::process::id() as _))

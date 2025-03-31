@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 use triomphe::Arc;
-use zerocopy::AsBytes;
+use zerocopy::IntoBytes;
 
 /// User callback to be called if the database encounters a fatal error
 pub type HaltCallbackFn = Box<dyn FnMut() + Send + Sync + 'static>;
