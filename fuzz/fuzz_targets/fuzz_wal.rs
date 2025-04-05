@@ -15,7 +15,31 @@ struct Input {
     min_file_size: u16,
     max_file_size: u16,
     max_iter_mem: u16,
-    ops: Vec<(u16, u16, bool)>,
+    ops: Vec<Op>,
+}
+
+#[derive(Debug, Arbitrary, Clone)]
+enum Op {
+    Writes(Vec<(LazyBytes, u8)>),
+    Trim(u16),
+    // Temporarely disabled
+    // Corrupt(u8, u32, u8),
+    FreshFile,
+}
+
+#[derive(Debug, Clone, Copy, Arbitrary)]
+struct LazyBytes {
+    len: u16,
+    seed: u16,
+}
+
+impl LazyBytes {
+    fn bytes(&self) -> Vec<u8> {
+        let mut r = rand::rngs::SmallRng::seed_from_u64(self.seed as u64);
+        let mut bytes = vec![0; self.len as usize];
+        r.fill(&mut bytes[..(self.len as usize).min(256)]);
+        bytes
+    }
 }
 
 fuzz_target!(|input: Input| {
@@ -28,80 +52,103 @@ fuzz_target!(|input: Input| {
         ops,
     } = input;
     let _ = env_logger::try_init();
-    let ops = ops
-        .iter()
-        .copied()
-        .map(|(l, c, f)| (bytes(l, c), f))
-        .collect::<Vec<_>>();
-    let mut idx = Vec::with_capacity(ops.len());
     let tmp = TempDir::new().unwrap();
-    let mut wal = Wal::with_options(
-        tmp.path().into(),
-        Options {
-            min_file_size: min_file_size as u64,
-            max_file_size: max_file_size as u64,
-            max_iter_mem: max_iter_mem as usize,
-            use_blocks,
-            use_direct_io,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    for _ in 0..2 {
-        for (o, use_file) in &ops {
-            if *use_file {
-                let mut f = tempfile().unwrap();
-                f.write_all(o).unwrap();
-                f.seek(std::io::SeekFrom::Start(0)).unwrap();
-                let mut f = BufReader::new(f);
-                idx.push(wal.write(&mut [&mut f]).unwrap());
-            } else {
-                idx.push(wal.write(&mut [&mut &o[..]]).unwrap());
+    let new_wal = || {
+        Wal::with_options(
+            tmp.path().into(),
+            Options {
+                min_file_size: min_file_size as u64,
+                max_file_size: max_file_size as u64,
+                max_iter_mem: max_iter_mem as usize,
+                use_blocks,
+                use_direct_io,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    };
+    let mut wal = new_wal();
+
+    let loops = 3;
+    let mut expected = Vec::with_capacity(ops.len() * loops);
+    let mut expected_idx = 0u64;
+    let mut expected_trim_offset = 0;
+    let mut has_corruption = false;
+    for loop_idx in 0..loops {
+        log::info!("loop {}", loop_idx);
+        for op in &ops {
+            log::info!("op: {:?}", op);
+            match op {
+                Op::Writes(writes) => {
+                    for &(o, rand_u8) in writes {
+                        let use_file = rand_u8 == u8::MAX;
+                        let bytes = o.bytes();
+                        log::info!("Writing {} bytes", bytes.len());
+                        let next_idx = if use_file {
+                            let mut f = tempfile().unwrap();
+                            f.write_all(&bytes).unwrap();
+                            f.seek(std::io::SeekFrom::Start(0)).unwrap();
+                            let mut f = BufReader::new(f);
+                            wal.write(&mut [&mut f]).unwrap()
+                        } else {
+                            wal.write(&mut [&mut o.bytes().as_slice()]).unwrap()
+                        };
+                        assert_eq!(next_idx, expected_idx);
+                        expected_idx += 1;
+                        expected.push((next_idx, o, use_file));
+                    }
+                }
+                &Op::Trim(p) => {
+                    log::info!("Trimming {}", p);
+                    wal.trim(p as WalIdx).unwrap();
+                    expected_trim_offset += expected[expected_trim_offset..]
+                        .iter()
+                        .take_while(|(i, _b, _f)| *i < p as u64)
+                        .count();
+                }
+                // &Op::Corrupt(f, offset, byte) => {
+                //     wal.fuzz_corrupt(f, offset, byte);
+                //     has_corruption = true;
+                // }
+                Op::FreshFile => wal.switch_to_fresh_file().unwrap(),
             }
         }
         drop(wal);
-        wal = Wal::new(tmp.path().into()).unwrap();
-        recover(&wal, &idx, &ops);
-        iter(&wal, &idx, &ops);
+        wal = new_wal();
+        let lost_count = recover(&wal, &expected[expected_trim_offset..], has_corruption);
+        expected.drain(expected.len() - lost_count..);
+        expected_idx -= lost_count as u64;
+        has_corruption = false;
     }
 });
 
-fn bytes(len: u16, content: u16) -> Vec<u8> {
-    let mut r = rand::rngs::SmallRng::seed_from_u64(content as u64);
-    let mut bytes = vec![0; len as usize];
-    r.fill(&mut bytes[..(len as usize).min(256)]);
-    bytes
-}
-
-fn recover(wal: &Wal, idx: &[WalIdx], ops: &[(Vec<u8>, bool)]) {
-    let mut ops_iter = idx.iter().copied().zip(ops.iter().cycle());
+/// This is a test to check that the WAL can recover correctly
+/// Returns the number of lost entries
+fn recover(wal: &Wal, expected: &[(WalIdx, LazyBytes, bool)], has_corruption: bool) -> usize {
+    log::info!("Recovering");
+    let mut expected_it = expected.iter().copied().peekable();
+    let mut recovered_count = 0;
     wal.recover().unwrap().for_each(|i| {
         let (recovered_idx, mut b) = i.unwrap();
+        log::debug!("Recovered {recovered_idx}");
         let mut bytes_recovered = Vec::new();
         b.read_to_end(&mut bytes_recovered).unwrap();
-        let (expected_idx, (expected_bytes, _f)) = ops_iter.next().unwrap();
-        assert_eq!(recovered_idx, expected_idx);
-        assert_eq!(&bytes_recovered, expected_bytes);
-    });
-}
-
-fn iter(wal: &Wal, idx: &[WalIdx], ops: &[(Vec<u8>, bool)]) {
-    let mut rng = rand::rngs::SmallRng::seed_from_u64(
-        *ops.get(0).map(|a| a.0.get(0)).flatten().unwrap_or(&0) as u64,
-    );
-    for _ in 0..5 {
-        let offset = rng.gen_range(0..=idx.len());
-        let mut count = 0;
-        for (a, (expected_idx, (expected_bytes, _))) in wal
-            .iter(offset as WalIdx)
-            .unwrap()
-            .zip(idx.iter().copied().zip(ops.iter().cycle()).skip(offset))
-        {
-            let (idx, from_wal) = a.unwrap();
-            assert_eq!(idx, expected_idx);
-            assert_eq!(&from_wal, expected_bytes);
-            count += 1;
+        let &(expected_idx, expected_bytes, _f) = expected_it.peek().unwrap();
+        if recovered_idx < expected_idx {
+            log::info!("Recovered {} < expected {}", recovered_idx, expected_idx);
+            return;
         }
-        assert_eq!(count, idx.len() - offset);
+        assert_eq!(recovered_idx, expected_idx);
+        assert_eq!(&bytes_recovered, expected_bytes.bytes().as_slice());
+        expected_it.next();
+        recovered_count += 1;
+    });
+    wal.finish_recover().unwrap();
+    if !has_corruption {
+        assert!(expected_it.peek().is_none());
     }
+    if !expected.is_empty() {
+        assert_ne!(wal.num_files(), 0);
+    }
+    expected.len() - recovered_count
 }

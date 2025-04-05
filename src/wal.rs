@@ -605,13 +605,13 @@ impl Wal {
 
     pub fn with_options(dir: PathBuf, mut options: Options) -> io::Result<Self> {
         if options.use_direct_io {
-            let path = dir.join("DIRECT_IO_TEST");
+            let test_path = dir.join("DIRECT_IO_TEST");
             let support_check = (|| {
-                let mut file = utils::create_direct_io_file(&path)?;
+                let mut file = utils::create_direct_io_file(&test_path)?;
                 let buffer = Block::default();
                 file.write_all(&buffer.0)
             })();
-            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&test_path);
             if let Err(e) = support_check {
                 warn!(
                     "WAL direct_io not supported under path {}: {e}",
@@ -680,6 +680,9 @@ impl Wal {
         Ok(file_paths)
     }
 
+    /// Iterate over all Wal entries in ascending order. This incrementally reads
+    /// and validates the Wal files and returns an iterator of (idx, reader).
+    /// Once the first recovery error is encountered, the iterator will stop.
     pub fn recover(
         &self,
     ) -> io::Result<impl Iterator<Item = io::Result<(WalIdx, Box<dyn Read>)>> + '_> {
@@ -748,20 +751,30 @@ impl Wal {
         }))
     }
 
+    /// After recovery(), remove logically invalid Wal Files on the back of the
+    /// Wal files list. These files were not initialized during the recovery step due
+    /// to recovery errors in earlier files. Leaving them in the list would
+    /// produce a gap in the Wal entries, which is invalid.
     pub fn finish_recover(&self) -> io::Result<()> {
         let mut files = self
             .files
             .try_write()
-            .expect("Wal was locked during recovery");
+            .expect("Wal was locked during finish_recover");
         let mut files_to_discard = Vec::new();
-        while let Some(mut o) = files.last_entry() {
-            let wf = o.get_mut().get_mut();
-            if wf.offset == 0 && wf.range.is_empty() {
-                let wf = o.remove();
-                files_to_discard.push(wf);
-            } else {
+        // We must always have at least one file, it defines the current position even if empty.
+        // So we look at the last 2 files at the end.
+        while let (Some(before_last_range), Some(o)) = (
+            files
+                .values_mut()
+                .nth_back(1)
+                .map(|wf| wf.get_mut().range()),
+            files.last_entry(),
+        ) {
+            // Check for continuity in WalIdx to stop the loop.
+            if before_last_range.end == *o.key() {
                 break;
             }
+            files_to_discard.push(o.remove());
         }
         if !files_to_discard.is_empty() {
             info!("Discarding {} Wal files", files_to_discard.len());
@@ -783,6 +796,21 @@ impl Wal {
             .read()
             .last_key_value()
             .map_or(WalIdx::default(), |(_, w)| w.read().range.end)
+    }
+
+    #[cfg(fuzzing)]
+    pub fn fuzz_corrupt(&mut self, nth_file: u8, nth_offset: u32, byte: u8) {
+        let mut files = self.files.write();
+        if files.is_empty() {
+            return;
+        }
+        let nth = nth_file as usize % files.len();
+        let file = files.values_mut().nth(nth).unwrap().get_mut();
+        if file.file_len == 0 {
+            return;
+        }
+        let offset = nth_offset as u64 % file.file_len;
+        file.file.write_all_at(&[byte], offset).unwrap();
     }
 
     #[cfg(any(fuzzing, test))]
@@ -821,7 +849,7 @@ impl Wal {
 
     /// Remove entries up to `until` (exclusive).
     pub fn trim(&self, until: WalIdx) -> io::Result<()> {
-        let mut files_to_delete: Vec<_> = self
+        let mut files_to_delete: SmallVec<_, 3> = self
             .files
             .read()
             .values()
