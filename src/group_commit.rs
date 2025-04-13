@@ -38,17 +38,24 @@ impl GroupCommit {
         }
     }
 
+    /// Performs a group commit of writes.
+    /// Writes slice must not be empty nor exceed the max_write_count.
     pub fn write(
         &self,
-        write: &mut [&mut dyn WalRead],
+        max_write_count: usize,
+        writes: &mut [&mut dyn WalRead],
         execute: impl FnOnce(&mut [&mut dyn WalRead]) -> Result<WalIdx, Error>,
     ) -> Result<WalIdx, Error> {
-        assert!(!write.is_empty());
+        assert!((1..=max_write_count).contains(&writes.len()));
         let mut result = Ok(WalIdx::MAX);
         let result_mut = NonNull::from(&mut result);
         let mut group = self.group.lock();
+        while group.queue.len() + writes.len() > max_write_count {
+            // joining group would cause writes to go over the limit, wait for it to be processed
+            self.condvar.wait(&mut group);
+        }
         let leader = group.queue.is_empty(); // requires !write.is_empty()
-        group.queue.extend(write.iter_mut().enumerate().map(
+        group.queue.extend(writes.iter_mut().enumerate().map(
             |(i, w): (usize, &mut &mut dyn WalRead)| {
                 let wal_read_ptr: NonNull<dyn WalRead> = (*w).into();
                 let wal_read_ptr: NonNull<dyn WalRead + 'static> =
@@ -99,7 +106,7 @@ impl GroupCommit {
             // join existing group as follower
             self.condvar.wait(&mut group);
         }
-        drop(group);
+
         debug_assert!(!matches!(result, Ok(WalIdx::MAX)));
         result
     }

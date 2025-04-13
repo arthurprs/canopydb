@@ -26,6 +26,8 @@ use crate::{
 
 pub use crate::repr::WalIdx;
 
+/// Upper (inclusive) limit on the number of items in a single commit.
+pub const MAX_ITEMS_PER_COMMIT: usize = 1024;
 const WAL_HEADER_MAGIC: u64 = 0xFA1A511793959196;
 const WAL_FOOTER_MAGIC: u64 = 0xF35C835A2600946B;
 const HEADER_BYTES_IGNORED_BY_CHECKSUM: usize = size_of::<u64>() * 2;
@@ -38,8 +40,8 @@ struct CommitHeader {
     checksum: u64,
     total_byte_len: u64,
     first_item_idx: u64,
-    items_byte_len: u64,
-    items_len: u64,
+    items_sum_len: u64,
+    items_count: u64,
 }
 
 #[derive(Default, Copy, Debug, Clone, FromBytes, IntoBytes, KnownLayout, Immutable)]
@@ -215,13 +217,19 @@ impl WalFileIter {
                 "Unexpected commit sequence",
             ));
         }
+        if header.items_count > MAX_ITEMS_PER_COMMIT as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Found commit with too many items",
+            ));
+        }
 
-        self.next_item_lens.resize(header.items_len as usize, 0);
+        self.next_item_lens.resize(header.items_count as usize, 0);
         let items_lens = self.next_item_lens.make_contiguous();
         self.file.read_exact_at(items_lens.as_mut_bytes(), offset)?;
         offset += items_lens.as_bytes().len() as u64;
 
-        if items_lens.iter().copied().sum::<u64>() != header.items_byte_len {
+        if items_lens.iter().copied().sum::<u64>() != header.items_sum_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Invalid item offsets",
@@ -229,7 +237,7 @@ impl WalFileIter {
         }
 
         let calc_total_byte_len =
-            offset - self.commit_offset + header.items_byte_len + size_of::<CommitFooter>() as u64;
+            offset - self.commit_offset + header.items_sum_len + size_of::<CommitFooter>() as u64;
         if calc_total_byte_len != header.total_byte_len
             && ceil_block_offset(calc_total_byte_len) != header.total_byte_len
         {
@@ -250,7 +258,7 @@ impl WalFileIter {
         }
 
         self.next_item_offset = offset;
-        let mut left_to_hash = header.items_byte_len;
+        let mut left_to_hash = header.items_sum_len;
         while left_to_hash != 0 {
             self.hasher_buffer.clear();
             let read_len = left_to_hash.min(self.hasher_buffer.capacity() as u64);
@@ -472,13 +480,13 @@ impl WalFile {
             checksum: 0,
             first_item_idx,
             total_byte_len: needed_size,
-            items_byte_len: 0,
-            items_len: items.len() as _,
+            items_sum_len: 0,
+            items_count: items.len() as u64,
         };
 
         for (item, i_len) in items.iter_mut().zip(item_lens.iter_mut()) {
             *i_len = item.len()?;
-            commit_header.items_byte_len += *i_len;
+            commit_header.items_sum_len += *i_len;
         }
         let mut hasher = xxhash_rust::xxh3::Xxh3Default::new();
         hasher.write(&commit_header.as_bytes()[HEADER_BYTES_IGNORED_BY_CHECKSUM..]);
@@ -810,6 +818,7 @@ impl Wal {
             return;
         }
         let offset = nth_offset as u64 % file.file_len;
+        warn!("Corrupting wal file {nth} at offset {offset} w/ byte {byte}");
         file.file.write_all_at(&[byte], offset).unwrap();
     }
 
@@ -918,7 +927,7 @@ impl Wal {
     }
 
     fn internal_write(&self, items: &mut [&mut dyn WalRead]) -> Result<WalIdx, Error> {
-        assert!(!items.is_empty());
+        assert!((1..=MAX_ITEMS_PER_COMMIT).contains(&items.len()));
         let mut buffer = self.buffer.lock();
         let mut files = self.files.upgradable_read();
         // We must check for halted after acquiring the locks,
@@ -951,7 +960,9 @@ impl Wal {
 
     pub fn write(&self, items: &mut [&mut dyn WalRead]) -> Result<WalIdx, Error> {
         self.group_commit
-            .write(items, |items| self.internal_write(items))
+            .write(MAX_ITEMS_PER_COMMIT, items, |items| {
+                self.internal_write(items)
+            })
     }
 
     pub fn disk_size(&self) -> u64 {
