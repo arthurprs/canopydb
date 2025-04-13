@@ -128,7 +128,8 @@ mod tests {
         #[cfg(feature = "shuttle")]
         const THREADS: usize = 5;
         #[cfg(feature = "shuttle")]
-        const WRITES_PER_THREAD: usize = 1_000;
+        const WRITES_PER_THREAD: usize = 5_000;
+        const MAX_WRITE_COUNT: usize = THREADS / 2;
         let g = Arc::new(GroupCommit::new(Some(Duration::default())));
         let b = Arc::new(sync::Barrier::new(THREADS));
         let writes = Arc::new(Mutex::new(Vec::new()));
@@ -143,6 +144,7 @@ mod tests {
                 for i in 0..WRITES_PER_THREAD {
                     let idx = g
                         .write(
+                            MAX_WRITE_COUNT,
                             &mut [&mut &[t as u8][..], &mut &i.to_be_bytes()[..]],
                             |batch| {
                                 let mut w = w.try_lock().unwrap();
