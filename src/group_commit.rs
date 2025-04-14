@@ -38,17 +38,24 @@ impl GroupCommit {
         }
     }
 
+    /// Performs a group commit of writes.
+    /// Writes slice must not be empty nor exceed the max_write_count.
     pub fn write(
         &self,
-        write: &mut [&mut dyn WalRead],
+        max_write_count: usize,
+        writes: &mut [&mut dyn WalRead],
         execute: impl FnOnce(&mut [&mut dyn WalRead]) -> Result<WalIdx, Error>,
     ) -> Result<WalIdx, Error> {
-        assert!(!write.is_empty());
+        assert!((1..=max_write_count).contains(&writes.len()));
         let mut result = Ok(WalIdx::MAX);
         let result_mut = NonNull::from(&mut result);
         let mut group = self.group.lock();
+        while group.queue.len() + writes.len() > max_write_count {
+            // joining group would cause writes to go over the limit, wait for it to be processed
+            self.condvar.wait(&mut group);
+        }
         let leader = group.queue.is_empty(); // requires !write.is_empty()
-        group.queue.extend(write.iter_mut().enumerate().map(
+        group.queue.extend(writes.iter_mut().enumerate().map(
             |(i, w): (usize, &mut &mut dyn WalRead)| {
                 let wal_read_ptr: NonNull<dyn WalRead> = (*w).into();
                 let wal_read_ptr: NonNull<dyn WalRead + 'static> =
@@ -99,7 +106,7 @@ impl GroupCommit {
             // join existing group as follower
             self.condvar.wait(&mut group);
         }
-        drop(group);
+
         debug_assert!(!matches!(result, Ok(WalIdx::MAX)));
         result
     }
@@ -121,7 +128,8 @@ mod tests {
         #[cfg(feature = "shuttle")]
         const THREADS: usize = 5;
         #[cfg(feature = "shuttle")]
-        const WRITES_PER_THREAD: usize = 1_000;
+        const WRITES_PER_THREAD: usize = 5_000;
+        const MAX_WRITE_COUNT: usize = THREADS / 2;
         let g = Arc::new(GroupCommit::new(Some(Duration::default())));
         let b = Arc::new(sync::Barrier::new(THREADS));
         let writes = Arc::new(Mutex::new(Vec::new()));
@@ -136,6 +144,7 @@ mod tests {
                 for i in 0..WRITES_PER_THREAD {
                     let idx = g
                         .write(
+                            MAX_WRITE_COUNT,
                             &mut [&mut &[t as u8][..], &mut &i.to_be_bytes()[..]],
                             |batch| {
                                 let mut w = w.try_lock().unwrap();

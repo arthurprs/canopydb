@@ -647,6 +647,9 @@ impl Environment {
     ///
     /// Note that all transactions involved must be from databases of the same Environment,
     /// and all transactions must be from databases with Wal enabled.
+    ///
+    /// The current limit for the number of transactions in a commit group is 1024 and the function
+    /// will return an error if the limit is exceeded.
     pub fn group_commit(
         &self,
         txs: impl IntoIterator<Item = WriteTransaction>,
@@ -665,6 +668,9 @@ impl Environment {
     ) -> Result<(), Error> {
         if txns.is_empty() {
             return Ok(());
+        }
+        if txns.len() > crate::wal::MAX_ITEMS_PER_COMMIT {
+            return Err(Error::validation("Too many transactions"));
         }
         let mut wb_readers = SmallVec::<WriteBatchReader, 4>::with_capacity(txns.len());
         for tx in &mut txns {

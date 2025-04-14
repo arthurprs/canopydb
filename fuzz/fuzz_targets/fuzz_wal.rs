@@ -20,10 +20,9 @@ struct Input {
 
 #[derive(Debug, Arbitrary, Clone)]
 enum Op {
-    Writes(Vec<(LazyBytes, u8)>),
+    Writes(LazyBytes, u8),
     Trim(u16),
-    // Temporarely disabled
-    // Corrupt(u8, u32, u8),
+    Corrupt(u8, u32, u8),
     FreshFile,
 }
 
@@ -71,63 +70,74 @@ fuzz_target!(|input: Input| {
 
     let loops = 3;
     let mut expected = Vec::with_capacity(ops.len() * loops);
-    let mut expected_idx = 0u64;
-    let mut expected_trim_offset = 0;
+    let mut expected_next_idx = 0u64;
+    let mut expected_start = 0;
     let mut has_corruption = false;
     for loop_idx in 0..loops {
         log::info!("loop {}", loop_idx);
         for op in &ops {
             log::info!("op: {:?}", op);
             match op {
-                Op::Writes(writes) => {
-                    for &(o, rand_u8) in writes {
-                        let use_file = rand_u8 == u8::MAX;
-                        let bytes = o.bytes();
-                        log::info!("Writing {} bytes", bytes.len());
-                        let next_idx = if use_file {
-                            let mut f = tempfile().unwrap();
-                            f.write_all(&bytes).unwrap();
-                            f.seek(std::io::SeekFrom::Start(0)).unwrap();
-                            let mut f = BufReader::new(f);
-                            wal.write(&mut [&mut f]).unwrap()
-                        } else {
-                            wal.write(&mut [&mut o.bytes().as_slice()]).unwrap()
-                        };
-                        assert_eq!(next_idx, expected_idx);
-                        expected_idx += 1;
-                        expected.push((next_idx, o, use_file));
-                    }
+                &Op::Writes(o, rand_u8) => {
+                    let use_file = rand_u8 == u8::MAX;
+                    let bytes = o.bytes();
+                    log::info!("Writing {} bytes", bytes.len());
+                    let next_idx = if use_file {
+                        let mut f = tempfile().unwrap();
+                        f.write_all(&bytes).unwrap();
+                        f.seek(std::io::SeekFrom::Start(0)).unwrap();
+                        let mut f = BufReader::new(f);
+                        wal.write(&mut [&mut f]).unwrap()
+                    } else {
+                        wal.write(&mut [&mut o.bytes().as_slice()]).unwrap()
+                    };
+                    assert_eq!(next_idx, expected_next_idx);
+                    expected_next_idx += 1;
+                    expected.push((next_idx, o, use_file));
+                    log::info!("Expected Next Idx: {}", expected_next_idx);
                 }
                 &Op::Trim(p) => {
                     log::info!("Trimming {}", p);
                     wal.trim(p as WalIdx).unwrap();
-                    expected_trim_offset += expected[expected_trim_offset..]
+                    expected_start += expected[expected_start as usize..]
                         .iter()
                         .take_while(|(i, _b, _f)| *i < p as u64)
-                        .count();
+                        .count() as WalIdx;
                 }
-                // &Op::Corrupt(f, offset, byte) => {
-                //     wal.fuzz_corrupt(f, offset, byte);
-                //     has_corruption = true;
-                // }
+                &Op::Corrupt(f, offset, byte) => {
+                    wal.fuzz_corrupt(f, offset, byte);
+                    has_corruption = true;
+                }
                 Op::FreshFile => wal.switch_to_fresh_file().unwrap(),
             }
         }
         drop(wal);
         wal = new_wal();
-        let lost_count = recover(&wal, &expected[expected_trim_offset..], has_corruption);
-        expected.drain(expected.len() - lost_count..);
-        expected_idx -= lost_count as u64;
+        recover(&wal, &expected, expected_start, has_corruption);
+        expected_next_idx = wal.head();
+        let not_valid_tail = expected
+            .iter()
+            .rev()
+            .take_while(|(i, _b, _f)| *i >= expected_next_idx)
+            .count();
+        expected.drain(expected.len() - not_valid_tail..);
+        expected_start = expected_start.min(expected.len() as WalIdx);
         has_corruption = false;
     }
 });
 
 /// This is a test to check that the WAL can recover correctly
-/// Returns the number of lost entries
-fn recover(wal: &Wal, expected: &[(WalIdx, LazyBytes, bool)], has_corruption: bool) -> usize {
+fn recover(
+    wal: &Wal,
+    expected: &[(WalIdx, LazyBytes, bool)],
+    expected_start: WalIdx,
+    has_corruption: bool,
+) {
     log::info!("Recovering");
-    let mut expected_it = expected.iter().copied().peekable();
-    let mut recovered_count = 0;
+    let mut expected_it = expected[expected_start as usize..]
+        .iter()
+        .copied()
+        .peekable();
     wal.recover().unwrap().for_each(|i| {
         let (recovered_idx, mut b) = i.unwrap();
         log::debug!("Recovered {recovered_idx}");
@@ -136,19 +146,22 @@ fn recover(wal: &Wal, expected: &[(WalIdx, LazyBytes, bool)], has_corruption: bo
         let &(expected_idx, expected_bytes, _f) = expected_it.peek().unwrap();
         if recovered_idx < expected_idx {
             log::info!("Recovered {} < expected {}", recovered_idx, expected_idx);
+            assert_eq!(
+                &bytes_recovered,
+                expected[recovered_idx as usize].1.bytes().as_slice()
+            );
             return;
         }
         assert_eq!(recovered_idx, expected_idx);
         assert_eq!(&bytes_recovered, expected_bytes.bytes().as_slice());
         expected_it.next();
-        recovered_count += 1;
     });
     wal.finish_recover().unwrap();
     if !has_corruption {
+        // if there was no corruption, we should have recovered all the expected entries
         assert!(expected_it.peek().is_none());
     }
     if !expected.is_empty() {
         assert_ne!(wal.num_files(), 0);
     }
-    expected.len() - recovered_count
 }
