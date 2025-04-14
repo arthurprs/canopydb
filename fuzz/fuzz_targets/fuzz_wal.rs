@@ -20,7 +20,7 @@ struct Input {
 
 #[derive(Debug, Arbitrary, Clone)]
 enum Op {
-    Writes(Vec<(LazyBytes, u8)>),
+    Writes(LazyBytes, u8),
     Trim(u16),
     Corrupt(u8, u32, u8),
     FreshFile,
@@ -78,24 +78,22 @@ fuzz_target!(|input: Input| {
         for op in &ops {
             log::info!("op: {:?}", op);
             match op {
-                Op::Writes(writes) => {
-                    for &(o, rand_u8) in writes {
-                        let use_file = rand_u8 == u8::MAX;
-                        let bytes = o.bytes();
-                        log::info!("Writing {} bytes", bytes.len());
-                        let next_idx = if use_file {
-                            let mut f = tempfile().unwrap();
-                            f.write_all(&bytes).unwrap();
-                            f.seek(std::io::SeekFrom::Start(0)).unwrap();
-                            let mut f = BufReader::new(f);
-                            wal.write(&mut [&mut f]).unwrap()
-                        } else {
-                            wal.write(&mut [&mut o.bytes().as_slice()]).unwrap()
-                        };
-                        assert_eq!(next_idx, expected_next_idx);
-                        expected_next_idx += 1;
-                        expected.push((next_idx, o, use_file));
-                    }
+                &Op::Writes(o, rand_u8) => {
+                    let use_file = rand_u8 == u8::MAX;
+                    let bytes = o.bytes();
+                    log::info!("Writing {} bytes", bytes.len());
+                    let next_idx = if use_file {
+                        let mut f = tempfile().unwrap();
+                        f.write_all(&bytes).unwrap();
+                        f.seek(std::io::SeekFrom::Start(0)).unwrap();
+                        let mut f = BufReader::new(f);
+                        wal.write(&mut [&mut f]).unwrap()
+                    } else {
+                        wal.write(&mut [&mut o.bytes().as_slice()]).unwrap()
+                    };
+                    assert_eq!(next_idx, expected_next_idx);
+                    expected_next_idx += 1;
+                    expected.push((next_idx, o, use_file));
                     log::info!("Expected Next Idx: {}", expected_next_idx);
                 }
                 &Op::Trim(p) => {

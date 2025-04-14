@@ -229,7 +229,11 @@ impl WalFileIter {
         self.file.read_exact_at(items_lens.as_mut_bytes(), offset)?;
         offset += items_lens.as_bytes().len() as u64;
 
-        if items_lens.iter().copied().sum::<u64>() != header.items_sum_len {
+        if items_lens
+            .iter()
+            .try_fold(0u64, |sum, a| sum.checked_add(*a))
+            != Some(header.items_sum_len)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Invalid item offsets",
