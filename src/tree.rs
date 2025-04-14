@@ -161,6 +161,14 @@ impl<'tx> Tree<'tx> {
     #[inline]
     fn inc_num_keys(&mut self, delta: i64) {
         if delta != 0 {
+            trace!(
+                "inc_num_keys {:?} ({} -> {}) {} -> {}",
+                self.name.as_deref().map(EscapedBytes),
+                self.len_delta,
+                self.len_delta + delta,
+                { self.value.num_keys },
+                self.value.num_keys.wrapping_add_signed(delta)
+            );
             self.value.num_keys = self.value.num_keys.wrapping_add_signed(delta);
             self.len_delta += delta;
             self.dirty = true;

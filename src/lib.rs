@@ -2427,27 +2427,30 @@ impl Transaction {
                 } => {
                     let existing = get_existing_tree_value(&trees_tree, tree_name)?;
                     let mut merged = existing.unwrap_or(*value);
-                    let needs_update;
+                    let trees_needs_update;
                     if existing.is_some() {
                         if merged.id != value.id {
                             return Err(Error::WriteConflict);
                         }
-                        if merged.root != PageId::default() && merged.root != value.root {
+                        if merged.root != PageId::default()
+                            && (merged.root != value.root || merged.level != value.level)
+                        {
                             return Err(Error::WriteConflict);
                         }
-                        needs_update = merged.root != value.root
+                        trees_needs_update = merged.root != value.root
                             || merged.level != value.level
                             || *len_delta != 0;
                         merged.root = value.root;
                         merged.level = value.level;
                         merged.num_keys = merged.num_keys.wrapping_add_signed(*len_delta);
                     } else {
-                        needs_update = true;
+                        trees_needs_update = true;
                     }
-                    if needs_update {
-                        *value = merged;
-                        trees_tree.insert(tree_name, value.as_bytes())?;
+                    if trees_needs_update {
+                        trees_tree.insert(tree_name, merged.as_bytes())?;
                     }
+                    // even if needs_update is false we may need to update num_keys
+                    *value = merged;
                     *dirty = false;
                     *len_delta = 0;
                 }
@@ -2556,13 +2559,13 @@ impl Transaction {
             state.spilled_total_span += self.nodes_spilled_span.get();
         }
 
-        if let Some(mut write_lock) = self.commit_lock.take() {
+        if let Some(mut commit_lock) = self.commit_lock.take() {
             // Release write lock and move the write state into it
             // TODO: consider limiting the size of some of these
-            write_lock.nodes = Some(mem::replace(self.nodes.get_mut(), void_dirty_cache()));
-            write_lock.trees = Some(mem::take(self.trees.get_mut()));
-            write_lock.scratch_buffer = mem::take(self.scratch_buffer.get_mut());
-            write_lock.wal_write_batch = self.wal_write_batch.get_mut().take().map(|mut wb| {
+            commit_lock.nodes = Some(mem::replace(self.nodes.get_mut(), void_dirty_cache()));
+            commit_lock.trees = Some(mem::take(self.trees.get_mut()));
+            commit_lock.scratch_buffer = mem::take(self.scratch_buffer.get_mut());
+            commit_lock.wal_write_batch = self.wal_write_batch.get_mut().take().map(|mut wb| {
                 wb.clear();
                 wb
             });
