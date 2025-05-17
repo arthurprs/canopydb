@@ -36,6 +36,7 @@ mod wal;
 #[macro_use]
 mod repr;
 mod error;
+mod fs;
 mod group_commit;
 mod shim;
 mod tree;

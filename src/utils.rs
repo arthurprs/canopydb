@@ -250,19 +250,18 @@ impl FileExt for std::fs::File {
     }
 
     #[cfg(all(unix, not(miri)))]
-    fn write_all_vectored_at(&self, bufs: &mut [IoSlice<'_>], offset: u64) -> io::Result<()> {
+    fn write_all_vectored_at(&self, mut bufs: &mut [IoSlice<'_>], offset: u64) -> io::Result<()> {
         fail::fail_point!("fwrite", |s| Err(io::Error::new(
             io::ErrorKind::Other,
             format!("failpoint fwrite {:?}", s)
         )));
         const MAX_VECTORS: usize = 128;
-        // Safety: This transmute is guaranteed to work on unix system, see IoSlice documentation.
-        let mut bufs: &mut [libc::iovec] = unsafe { std::mem::transmute(bufs) };
         while !bufs.is_empty() {
             let result = nix::Error::result(unsafe {
                 libc::pwritev(
                     self.as_raw_fd(),
-                    bufs.as_ptr(),
+                    // Safety: This transmute is guaranteed to work on unix system, see IoSlice documentation.
+                    bufs.as_ptr().cast(),
                     std::cmp::min(bufs.len(), MAX_VECTORS) as libc::c_int,
                     offset as libc::off_t,
                 )
@@ -275,7 +274,7 @@ impl FileExt for std::fs::File {
                         "failed to write whole buffer",
                     ));
                 }
-                Ok(n) => unsafe { advance_iovecs(&mut bufs, n as usize) },
+                Ok(n) => IoSlice::advance_slices(&mut bufs, n as usize),
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
@@ -340,39 +339,6 @@ pub fn vec_drain_if<T>(vec: &mut Vec<T>, mut cond: impl FnMut(&T) -> bool) -> st
     }
     let slice_offset = (slice.as_ptr() as usize - vec.as_ptr() as usize) / size_of::<T>();
     vec.drain(slice_offset..)
-}
-
-// TODO: replace with rust 1.81 IoSlice::advance_slices
-#[cfg(all(unix, not(miri)))]
-unsafe fn advance_iovecs(bufs: &mut &mut [libc::iovec], n: usize) {
-    // Number of buffers to remove.
-    let mut remove = 0;
-    // Total length of all the to be removed buffers.
-    let mut accumulated_len = 0;
-    for buf in bufs.iter() {
-        if accumulated_len + buf.iov_len > n {
-            break;
-        } else {
-            accumulated_len += buf.iov_len;
-            remove += 1;
-        }
-    }
-
-    *bufs = &mut std::mem::take(bufs)[remove..];
-    if bufs.is_empty() {
-        assert!(
-            n == accumulated_len,
-            "advancing io slices beyond their length"
-        );
-    } else {
-        let adv_0_by = n - accumulated_len;
-        bufs[0].iov_base = bufs[0]
-            .iov_base
-            .cast::<u8>()
-            .add(adv_0_by)
-            .cast::<libc::c_void>();
-        bufs[0].iov_len -= adv_0_by;
-    }
 }
 
 /// Automatically calls the enclosed function on panics
