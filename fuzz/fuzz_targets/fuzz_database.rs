@@ -76,25 +76,6 @@ impl<'a, const MIN: usize, const MAX: usize> Arbitrary<'a> for Uint<MIN, MAX> {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, PartialOrd, Eq, Ord, Hash)]
-struct VecN<const MIN: usize, const MAX: usize, T>(Vec<T>);
-
-impl<'a, const MIN: usize, const MAX: usize, T: Arbitrary<'a>> Arbitrary<'a> for VecN<MIN, MAX, T> {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        let n = u.int_in_range(MIN as u32..=MAX as u32)?;
-        let mut v = Vec::with_capacity(n as usize);
-        for _ in 0..n {
-            v.push(u.arbitrary()?);
-        }
-        Ok(VecN(v))
-    }
-
-    fn size_hint(depth: usize) -> (usize, Option<usize>) {
-        let a = <u32 as Arbitrary>::size_hint(depth).0;
-        (a, None)
-    }
-}
-
 #[derive(Clone, Default, PartialEq, PartialOrd, Eq, Ord, Hash)]
 struct BytesN<const MIN: usize, const MAX: usize>(Rc<Vec<u8>>);
 

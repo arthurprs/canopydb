@@ -1,6 +1,4 @@
-#![feature(btree_extract_if)]
 #![no_main]
-
 use std::collections::BTreeSet;
 
 use canopydb::freelist::Freelist;
@@ -22,7 +20,7 @@ struct Input {
 }
 
 fn btree_remove_range(set: &mut BTreeSet<u32>, start: u32, end: u32) -> u32 {
-    set.extract_if(|&i| i >= start && i < end).count() as u32
+    set.extract_if(start..end, |_| true).count() as u32
 }
 
 fuzz_target!(|input: Input| {
