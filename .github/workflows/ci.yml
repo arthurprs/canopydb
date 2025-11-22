@@ -99,8 +99,9 @@ jobs:
           toolchain: nightly
           override: true
       - run: cargo doc --package canopydb
-        env:
-          RUSTDOCFLAGS: --cfg docsrs
+        # Temporarily disabled due to doc_auto_cfg removal in nightly
+        # env:
+          # RUSTDOCFLAGS: --cfg docsrs
 
   fuzz-tests:
     name: Fuzz tests
