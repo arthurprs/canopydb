@@ -453,7 +453,7 @@ impl Shard {
 
     #[must_use]
     fn validate(&self) -> bool {
-        if self.base % SHARD_MAX_LEN != 0 {
+        if !self.base.is_multiple_of(SHARD_MAX_LEN) {
             return false;
         }
         for w in self.ranges.windows(2) {

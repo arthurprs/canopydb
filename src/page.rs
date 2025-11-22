@@ -36,9 +36,9 @@ impl<const CLONE: bool> Page<CLONE> {
             raw_data,
         };
         let total_page_size = size_of::<ReservedPageHeader>() + page.raw_data.len();
-        if page.raw_data.as_ptr() as usize % 8 != 0 {
+        if !(page.raw_data.as_ptr() as usize).is_multiple_of(8) {
             Err(io_invalid_input!("Bad page alignment"))
-        } else if total_page_size % PAGE_SIZE as usize != 0
+        } else if !total_page_size.is_multiple_of(PAGE_SIZE as usize)
             || page.span() != ((total_page_size / PAGE_SIZE as usize) as PageId)
         {
             Err(io_invalid_input!("Bad page len"))

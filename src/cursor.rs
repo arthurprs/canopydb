@@ -335,7 +335,9 @@ impl<'tx, 'tree> Cursor<'tx, 'tree> {
         }
     }
 
-    fn stack_peek(stack: &[(UntypedNode, usize)]) -> Option<(&LeafNode, &[u8], &[u8], MaybeValue)> {
+    fn stack_peek(
+        stack: &[(UntypedNode, usize)],
+    ) -> Option<(&LeafNode, &[u8], &[u8], MaybeValue<'_>)> {
         if let Some(&(ref node, idx)) = stack.last() {
             let leaf = node.as_leaf();
             if idx < leaf.num_keys() {

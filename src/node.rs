@@ -1072,13 +1072,13 @@ impl<TYPE: NodeType> DirtyNode<'_, TYPE> {
 
     #[allow(dead_code)]
     #[inline]
-    pub fn as_leaf(&mut self) -> DirtyLeafNode {
+    pub fn as_leaf(&mut self) -> DirtyLeafNode<'_> {
         assert!(self.is_leaf());
         unsafe { mem::transmute_copy(self) }
     }
 
     #[inline]
-    pub fn as_branch(&mut self) -> DirtyBranchNode {
+    pub fn as_branch(&mut self) -> DirtyBranchNode<'_> {
         assert!(self.is_branch());
         unsafe { mem::transmute_copy(self) }
     }
@@ -1155,7 +1155,7 @@ impl<TYPE: NodeRepr, const CLONE: bool> Node<TYPE, CLONE> {
     }
 
     #[inline]
-    pub fn full_key_at(&self, i: usize) -> Cow<[u8]> {
+    pub fn full_key_at(&self, i: usize) -> Cow<'_, [u8]> {
         let suffix = self.offsets().key(i);
         if self.key_prefix_len() == 0 {
             Cow::Borrowed(suffix)
@@ -1497,7 +1497,7 @@ impl<const CLONE: bool> LeafNode<CLONE> {
     }
 
     #[inline]
-    pub fn key_value_at(&self, i: usize) -> (&[u8], MaybeValue) {
+    pub fn key_value_at(&self, i: usize) -> (&[u8], MaybeValue<'_>) {
         let (repr2, key, v) = self.offsets().triplet(i);
         let value = if repr2.is_overflow() {
             MaybeValue::overflow_from_bytes(v)
@@ -1508,7 +1508,7 @@ impl<const CLONE: bool> LeafNode<CLONE> {
     }
 
     #[inline]
-    pub fn value_at(&self, i: usize) -> MaybeValue {
+    pub fn value_at(&self, i: usize) -> MaybeValue<'_> {
         self.key_value_at(i).1
     }
 }
@@ -1583,7 +1583,7 @@ fn test_read_prefix_u32() {
     samples.sort();
     let conv = samples
         .iter()
-        .map(|v| read_prefix_u32(&v))
+        .map(|v| read_prefix_u32(v))
         .collect::<Vec<_>>();
     assert!(conv.windows(2).all(|a| a[0] <= a[1]));
 }

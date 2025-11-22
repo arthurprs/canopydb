@@ -137,6 +137,7 @@ enum Op {
     Update(ActorId, usize, Bytes, Failure),
     Delete(ActorId, usize, Failure),
     DeleteRange(ActorId, (Bound<Bytes>, Bound<Bytes>), Failure),
+    #[allow(dead_code)]
     ReadTx(ActorId, Failure),
 }
 

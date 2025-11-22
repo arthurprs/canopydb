@@ -602,12 +602,14 @@ impl Environment {
             let env_handle = self.handle.clone();
             *open = Some(env_handle.clone());
             drop(open);
-            if db_options.is_some() && Some(&inner.opts.db) != db_options.as_ref() {
-                inner.stop_bg_thread(true);
-                dbs.remove(db_name);
-                StdArc::get_mut(&mut inner).unwrap().opts.db = db_options.unwrap();
-                DatabaseInner::start_bg_thread(&inner);
-                dbs.insert(db_name.into(), StdArc::downgrade(&inner));
+            if let Some(options) = db_options {
+                if Some(&inner.opts.db) != Some(&options) {
+                    inner.stop_bg_thread(true);
+                    dbs.remove(db_name);
+                    StdArc::get_mut(&mut inner).unwrap().opts.db = options;
+                    DatabaseInner::start_bg_thread(&inner);
+                    dbs.insert(db_name.into(), StdArc::downgrade(&inner));
+                }
             }
             return Ok(Some(Database { inner, env_handle }));
         }
