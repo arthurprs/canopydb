@@ -31,8 +31,9 @@ derive_more = { version = "2", features = [
     "error",
 ] }
 fail = "0.5"
-# pending https://github.com/brunoczim/fslock/pull/17, but only relevant for miri tests
-fslock = { git = "https://github.com/arthurprs/fslock.git", rev = "7ec91154136a2b3d567b1f79e87cae5d3ca3d927", version = "0.2" }
+# pending https://github.com/brunoczim/fslock/pull/20 and pull/17 release
+# relevant for miri tests and linux arm64 targets
+fslock = { git = "https://github.com/arthurprs/fslock.git", rev = "045189e0ccddb6b71cddcfaa80484db8df6bfa28", version = "0.2" }
 quick_cache = { version = "0.6.11", default-features = false, features = [
     "parking_lot",
 ] }
