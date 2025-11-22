@@ -2294,10 +2294,9 @@ impl Transaction {
             if last_open_tx_lte + 1 >= releasing_tx_id {
                 continue;
             }
-            to_free.extend(utils::vec_drain_if(
-                pending,
-                |&FreePage(visible_from, _)| visible_from > last_open_tx_lte,
-            ));
+            to_free.extend(pending.extract_if(.., |&mut FreePage(visible_from, _)| {
+                visible_from > last_open_tx_lte
+            }));
             if pending.is_empty() {
                 emptied.push(releasing_tx_id);
             }
