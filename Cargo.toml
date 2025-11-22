@@ -35,7 +35,7 @@ fslock = { git = "https://github.com/arthurprs/fslock.git", rev = "7ec91154136a2
 quick_cache = { version = "0.6.11", default-features = false, features = [
     "parking_lot",
 ] }
-smallvec = { version = "2.0.0-alpha.11" }
+smallvec = { version = "=2.0.0-alpha.11" }
 lock_api = { version = "0.4", features = ["arc_lock"] }
 log = "0.4"
 tempfile = "3.16"
