@@ -61,7 +61,7 @@ pub fn fadvise_wont_need(f: &File, len: u64) -> io::Result<()> {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     {
         let _ = nix::fcntl::posix_fadvise(
-            f.as_raw_fd(),
+            f,
             0,
             len as _,
             nix::fcntl::PosixFadviseAdvice::POSIX_FADV_DONTNEED,
@@ -74,7 +74,7 @@ pub fn fadvise_wont_need(f: &File, len: u64) -> io::Result<()> {
 pub fn fadvise_read_ahead(file: &File, read_ahead: bool) -> io::Result<()> {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     let _ = nix::fcntl::posix_fadvise(
-        file.as_raw_fd(),
+        file,
         0,
         0,
         if read_ahead {

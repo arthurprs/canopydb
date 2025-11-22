@@ -924,7 +924,7 @@ impl<'tx> Tree<'tx> {
     /// If values aren't required, [Tree::prefix_keys] may be more efficient.
     pub fn prefix<K: AsRef<[u8]>>(&self, prefix: &K) -> Result<RangeIter<'_>, Error> {
         let start = prefix.as_ref();
-        let mut end = SmallVec::<u8, 256>::from_slice(start);
+        let mut end = SmallVec::<u8, 256>::from_slice_copy(start);
         for (i, b) in end.iter_mut().enumerate().rev() {
             if *b < u8::MAX {
                 *b += 1;

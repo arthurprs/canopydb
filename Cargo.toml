@@ -19,7 +19,7 @@ shuttle = ["dep:shuttle", "dep:rand_08"]
 nightly = []
 
 [dependencies]
-foldhash = "0.1.5"
+foldhash = "0.2"
 bitflags = "2"
 dashmap = "=7.0.0-rc2"
 derive_more = { version = "2", features = [
@@ -35,12 +35,12 @@ fslock = { git = "https://github.com/arthurprs/fslock.git", rev = "7ec91154136a2
 quick_cache = { version = "0.6.11", default-features = false, features = [
     "parking_lot",
 ] }
-smallvec = { version = "=2.0.0-alpha.11" }
+smallvec = { version = "=2.0.0-alpha.12" }
 lock_api = { version = "0.4", features = ["arc_lock"] }
 log = "0.4"
 tempfile = "3.16"
 triomphe = { version = "0.1.14", default-features = false }
-lz4_flex = { version = "0.11", default-features = false, features = ["std"] }
+lz4_flex = { version = "0.12", default-features = false, features = ["std"] }
 parking_lot = { version = "0.12", features = ["send_guard"] }
 rand = { version = "0.9" }
 rand_08 = { package = "rand", version = "0.8", optional = true }
@@ -52,7 +52,7 @@ serde_json = { version = "1" }
 serde = { version = "1", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.29", features = ["fs", "mman"] }
+nix = { version = "0.30", features = ["fs", "mman"] }
 libc = { version = "0.2" }
 
 [profile.test]

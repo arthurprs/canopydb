@@ -6,28 +6,51 @@
 
 Embedded Key-Value Storage Engine
 
-* Fully transactional
-* Ordered map API similar to `std::collections::BTreeMap`
-* B+Tree implementation with prefix and suffix truncation
-* Handles large values efficiently, with optional transparent compression
-* Efficient IO utilization, with lower read and write amplification compared to alternatives
-* Efficient durable commits via an optional Write-Ahead-Log (WAL)
-* Efficient async durability with background WAL fsyncs (e.g. every 500ms)
-* Bounded recovery times using an optional Write-Ahead-Log (WAL)
-* Concurrent write transactions with Optimistic Concurrency Control (OCC)
-* ACID transactions with serializable snapshot isolation (SSI) or snapshot isolation (SI)
-* Multi-Version-Concurrency-Control (MVCC) - writers do not block readers and vice versa
-* Long running read transactions have limited impact on the database
-* Supports larger than memory transactions
-* Multiple key spaces per database - key space (Tree) management is fully transactional
-* Multiple databases per environment - efficiently shares resources such as the WAL and page cache
-* Supports cross database atomic commits
+### Core Features
+* **Fully transactional** - ACID guarantees with serializable snapshot isolation (SSI) or snapshot isolation (SI)
+* **Ordered map API** - Similar to `std::collections::BTreeMap` with range queries
+* **B+Tree implementation** - With prefix and suffix truncation for efficient storage
+* **Multi-Version Concurrency Control (MVCC)** - Writers don't block readers and vice versa
 
-The storage engine is optimized for read heavy and read-modify-write workloads where a lightweight transactional key-value store is desired. If you need a different set of tradeoffs such as extreme random write performance, you're probably looking for [Fjall](https://github.com/fjall-rs/) or [RocksDb](https://github.com/facebook/rocksdb/).
+### Performance & Efficiency
+* **Optimized for reads** - Low read amplification compared to LSM-tree alternatives
+* **Efficient writes** - Lower write amplification than most alternatives
+* **Large value support** - Handles large values efficiently with optional transparent compression
+* **Memory efficiency** - Supports larger-than-memory transactions
+* **Minimal impact** - Long running read transactions have limited impact on the database
+
+### Durability & Recovery
+* **Write-Ahead Log (WAL)** - Optional WAL for efficient durable commits
+* **Async durability** - Background WAL fsyncs for high throughput (e.g. every 500ms)
+* **Bounded recovery** - Predictable recovery times with periodic checkpointing
+
+### Concurrency & Scalability
+* **Concurrent writes** - Multiple write transactions with Optimistic Concurrency Control (OCC)
+* **Multiple trees** - Multiple key spaces per database, fully transactional
+* **Multiple databases** - Per environment with shared resources (WAL, page cache)
+* **Cross-database commits** - Atomic commits across multiple databases
+
+## When to Use Canopydb
+
+Canopydb is optimized for read-heavy and read-modify-write workloads where a lightweight transactional key-value store is desired:
+
+* **Read-dominated workloads** - When reads significantly outnumber writes
+* **Transactional requirements** - When you need ACID guarantees but SQLite is overkill
+* **Ordered data access** - When you need efficient range queries and sorted iteration
+* **Embedded scenarios** - When you want to avoid separate database processes
+* **Cross-database consistency** - When you need atomic operations across multiple databases
+
+If you need extreme random write performance or write-heavy workloads, consider [Fjall](https://github.com/fjall-rs/) or [RocksDb](https://github.com/facebook/rocksdb/) instead.
 
 ## Examples
 
-Basic usage
+More examples can be found in the [examples/](examples/) directory:
+- [`basic_usage.rs`](examples/basic_usage.rs) - Getting started with Canopydb
+- [`multi_writer.rs`](examples/multi_writer.rs) - Concurrent write transactions
+- [`one_env_many_dbs.rs`](examples/one_env_many_dbs.rs) - Multiple databases in one environment
+- [`fixed_len_key_value.rs`](examples/fixed_len_key_value.rs) - Working with fixed-length data
+
+### Basic CRUD Operations
 
 ```rust
 let sample_data: [(&[u8], &[u8]); 3] = [
@@ -70,7 +93,7 @@ for kv_pair_result in tree.iter().unwrap() {
 }
 ```
 
-Concurrent write transactions
+### Concurrent Write Transactions with Retry Logic
 
 ```rust
 const THREADS: usize = 4;
@@ -116,7 +139,7 @@ println!("Final value: {value_usize}");
 assert_eq!(THREADS * INC_PER_THREAD, value_usize);
 ```
 
-Multiple databases per environment
+### Multiple Databases with Atomic Cross-Database Commits
 
 ```rust
 let sample_data = [
