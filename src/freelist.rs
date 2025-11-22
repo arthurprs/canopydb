@@ -487,7 +487,7 @@ impl Shard {
             *self = other.clone();
         } else if self.ranges.first().unwrap().page_end() <= other.ranges.last().unwrap().page() {
             let ranges = range_vec_make_mut(&mut self.ranges, other.ranges.len());
-            ranges.insert_from_slice(0, &other.ranges);
+            ranges.insert_from_slice_copy(0, &other.ranges);
             self.hist.merge(&other.hist);
             self.len += other.len;
             Self::shift_lower(other.ranges.len(), ranges, &mut self.hist);
