@@ -324,7 +324,10 @@ impl FileExt for std::fs::File {
 
 /// Replacement for the unstable method Vec::extract_if
 /// but might shuffle the original vector and also returns the items in arbitrary order.
-pub fn vec_drain_if<T>(vec: &mut Vec<T>, mut cond: impl FnMut(&T) -> bool) -> std::vec::Drain<T> {
+pub fn vec_drain_if<T>(
+    vec: &mut Vec<T>,
+    mut cond: impl FnMut(&T) -> bool,
+) -> std::vec::Drain<'_, T> {
     assert_ne!(size_of::<T>(), 0);
     let mut slice = vec.as_mut_slice();
     while let Some((head, tail)) = slice.split_first_mut() {
@@ -407,7 +410,7 @@ pub struct TrapGuard<'a>(Option<&'a AtomicBool>);
 
 impl Trap {
     #[inline]
-    pub fn setup(&self) -> Result<TrapGuard, Error> {
+    pub fn setup(&self) -> Result<TrapGuard<'_>, Error> {
         self.check()?;
         Ok(TrapGuard(Some(&self.0)))
     }

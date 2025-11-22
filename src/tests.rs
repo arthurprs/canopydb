@@ -1231,9 +1231,11 @@ fn compatible_tree_options() {
 
     for (k, v, nk, nv) in [(-1, -1, 4, 4), (4, 4, 3, 4), (4, 4, 4, 3)] {
         let tx = db.begin_write().unwrap();
-        let mut tree_opt = options::TreeOptions::default();
-        tree_opt.fixed_key_len = k;
-        tree_opt.fixed_value_len = v;
+        let mut tree_opt = options::TreeOptions {
+            fixed_key_len: k,
+            fixed_value_len: v,
+            ..Default::default()
+        };
         _ = tx
             .get_or_create_tree_with(b"default", tree_opt.clone())
             .unwrap();
@@ -1286,9 +1288,11 @@ fn insert_fixed_size() {
             .collect();
 
         let tx = db.begin_write().unwrap();
-        let mut tree_opt = options::TreeOptions::default();
-        tree_opt.fixed_key_len = K_LEN.try_into().unwrap();
-        tree_opt.fixed_value_len = V_LEN.try_into().unwrap();
+        let tree_opt = options::TreeOptions {
+            fixed_key_len: K_LEN.try_into().unwrap(),
+            fixed_value_len: V_LEN.try_into().unwrap(),
+            ..Default::default()
+        };
         let mut tree = tx.get_or_create_tree_with(b"default", tree_opt).unwrap();
 
         for (k, v) in &sample {
@@ -1358,7 +1362,7 @@ fn spill_works() {
     let mut rng = get_rng();
     let env_opts = EnvOptions::new(t.path());
     let mut db_opts = DbOptions::new();
-    db_opts.write_txn_memory_limit = 1 * 1024 * 1024;
+    db_opts.write_txn_memory_limit = 1024 * 1024;
     db_opts.checkpoint_target_size = 10 * 1024 * 1024;
     let db = Database::with_options(env_opts, db_opts).unwrap();
 

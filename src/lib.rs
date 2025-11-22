@@ -1559,7 +1559,7 @@ impl Transaction {
         Ok(())
     }
 
-    fn get_trees_tree(&self) -> Tree {
+    fn get_trees_tree(&self) -> Tree<'_> {
         Tree {
             name: Default::default(),
             value: self.state.get().metapage.trees_tree,
@@ -1570,7 +1570,7 @@ impl Transaction {
         }
     }
 
-    fn get_indirection_tree(&self) -> Tree {
+    fn get_indirection_tree(&self) -> Tree<'_> {
         Tree {
             name: Default::default(),
             value: self.state.get().metapage.indirections_tree,

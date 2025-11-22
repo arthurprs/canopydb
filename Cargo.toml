@@ -10,6 +10,7 @@ repository = "https://github.com/arthurprs/canopydb"
 keywords = ["database", "storage-engine", "embedded-database", "key-value"]
 categories = ["data-structures", "database-implementations", "algorithms"]
 exclude = ["fuzz/", "assets/"]
+rust-version = "1.87.0"
 
 [features]
 default = []

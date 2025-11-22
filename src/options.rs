@@ -1,3 +1,4 @@
+#[cfg_attr(fuzzing, allow(unused_imports))]
 use crate::{
     error::{error_validation, Error},
     repr::{TreeId, TreeValue},

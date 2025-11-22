@@ -310,12 +310,6 @@ impl TreeValue {
     }
 }
 
-#[derive(Default, Copy, Clone, FromBytes, IntoBytes, Unaligned, PartialEq, Eq)]
-#[repr(C, packed)]
-pub struct MappingValue {
-    pub compressed_page_id: PageId,
-}
-
 pub trait NodeRepr: NodeType {
     type Header: Default
         + FromBytes
