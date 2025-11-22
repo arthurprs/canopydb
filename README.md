@@ -6,49 +6,50 @@
 
 Embedded Key-Value Storage Engine
 
-### Core Features
-* **Fully transactional** - ACID guarantees with serializable snapshot isolation (SSI) or snapshot isolation (SI)
-* **Ordered map API** - Similar to `std::collections::BTreeMap` with range queries
-* **B+Tree implementation** - With prefix and suffix truncation for efficient storage
-* **Multi-Version Concurrency Control (MVCC)** - Writers don't block readers and vice versa
+* **Transactional** - ACID guarantees with serializable snapshot isolation (SSI) or snapshot isolation (SI)
+* **Ordered map API** - Similar to `std::collections::BTreeMap` with efficient range queries, prefix scans, ordered iteration and range deletes.
+* **Compact B+Tree** - Transparent key compression via prefix/suffix truncation
 
-### Performance & Efficiency
-* **Optimized for reads** - Low read amplification compared to LSM-tree alternatives
+### Performance
+
+* **Optimized for reads** - Predictable and fast reads with low read amplification
 * **Efficient writes** - Lower write amplification than most alternatives
 * **Large value support** - Handles large values efficiently with optional transparent compression
-* **Memory efficiency** - Supports larger-than-memory transactions
-* **Minimal impact** - Long running read transactions have limited impact on the database
+* **Memory efficient** - Supports larger-than-memory transactions
+* **Read transactions** - Long running read transactions have limited impact on the database
+
+### Concurrency
+
+* **Lock-free reads** - Read transactions never block writers or other readers via Multi-Version Concurrency Control (MVCC)
+* **Concurrent writes** - Multiple write transactions with Optimistic Concurrency Control (OCC) and Snapshot Isolation (SI).
+* **Multiple keyspaces** - Multiple trees (key spaces) per database, fully transactional
+* **Multiple databases** - Per environment with shared resources (WAL, page cache)
+* **Cross-database commits** - Atomic commits across databases in the same environment
 
 ### Durability & Recovery
-* **Write-Ahead Log (WAL)** - Optional WAL for efficient durable commits
-* **Async durability** - Background WAL fsyncs for high throughput (e.g. every 500ms)
-* **Bounded recovery** - Predictable recovery times with periodic checkpointing
 
-### Concurrency & Scalability
-* **Concurrent writes** - Multiple write transactions with Optimistic Concurrency Control (OCC)
-* **Multiple trees** - Multiple key spaces per database, fully transactional
-* **Multiple databases** - Per environment with shared resources (WAL, page cache)
-* **Cross-database commits** - Atomic commits across multiple databases
+* **Write-Ahead Log (WAL)** - Optional WAL for efficient durable commits.
+* **Async durability** - Background WAL fsyncs for high throughput (e.g. every 500ms)
+* **Bounded recovery** - Predictable recovery times with periodic consistent checkpoints
 
 ## When to Use Canopydb
 
 Canopydb is optimized for read-heavy and read-modify-write workloads where a lightweight transactional key-value store is desired:
 
-* **Read-dominated workloads** - When reads significantly outnumber writes
-* **Transactional requirements** - When you need ACID guarantees but SQLite is overkill
-* **Ordered data access** - When you need efficient range queries and sorted iteration
+* **Read-heavy workloads** - When reads significantly outnumber writes
+* **Transactional requirements** - When SQLite is slow or too much
 * **Embedded scenarios** - When you want to avoid separate database processes
-* **Cross-database consistency** - When you need atomic operations across multiple databases
 
-If you need extreme random write performance or write-heavy workloads, consider [Fjall](https://github.com/fjall-rs/) or [RocksDb](https://github.com/facebook/rocksdb/) instead.
+If you need extreme random write performance or write-heavy workloads, consider [Fjall](https://github.com/fjall-rs/) or [RocksDb](https://github.com/facebook/rocksdb/). If you need relational features, joins, or SQL consider SQLite.
 
 ## Examples
 
 More examples can be found in the [examples/](examples/) directory:
-- [`basic_usage.rs`](examples/basic_usage.rs) - Getting started with Canopydb
-- [`multi_writer.rs`](examples/multi_writer.rs) - Concurrent write transactions
-- [`one_env_many_dbs.rs`](examples/one_env_many_dbs.rs) - Multiple databases in one environment
-- [`fixed_len_key_value.rs`](examples/fixed_len_key_value.rs) - Working with fixed-length data
+
+* [`basic_usage.rs`](examples/basic_usage.rs) - Getting started with Canopydb
+* [`multi_writer.rs`](examples/multi_writer.rs) - Concurrent write transactions
+* [`one_env_many_dbs.rs`](examples/one_env_many_dbs.rs) - Multiple databases in one environment
+* [`fixed_len_key_value.rs`](examples/fixed_len_key_value.rs) - Working with fixed-length data
 
 ### Basic CRUD Operations
 
@@ -173,12 +174,6 @@ let tx2 = db2.begin_write().unwrap();
 env.group_commit([tx1, tx2], false).unwrap();
 ```
 
-## Status
-
-Canopydb should be considered early stage software and new releases could be incompatible. Do not trust it with production data.
-
-Help is welcome to test and improve it, hopefully removing the disclaimer above. It's been an experimental project for many years and rewritten a few times. Even though it's reasonably well tested, there could be bugs and sharp API corners.
-
 ## Benchmarks
 
 See the [BENCHMARKS.md](https://github.com/arthurprs/canopydb/blob/master/BENCHMARKS.md) file in the repository.
@@ -202,6 +197,12 @@ Canopydb and Redb are similar. Redb has a richer API that includes strongly type
 ### Fjall and Rocksdb
 
 Rocksdb and Fjall both implement Log-Structured-Merge Trees (LSMs) with optional support for transactions. These implementations can achieve higher random write performance, read-free writes and lower space utilization. Although these may come with tradeoffs like utilizing more file descriptors, more CPU overhead and write transactions that must fit in memory.
+
+## Status
+
+Canopydb should be considered early stage software and new releases could be incompatible. Do not trust it with production data.
+
+Help is welcome to test and improve it, hopefully removing the disclaimer above. It's been an experimental project for many years and rewritten a few times. Even though it's reasonably well tested, there could be bugs and sharp API corners.
 
 ## License
 
